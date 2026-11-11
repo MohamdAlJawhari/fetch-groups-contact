@@ -1,0 +1,355 @@
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
+import { test } from 'node:test';
+import { createApp } from '../src/app.js';
+import { AuthService } from '../src/modules/auth/auth.service.js';
+import { BcryptPasswordHasher } from '../src/modules/auth/password.hasher.js';
+import { SessionStore } from '../src/modules/auth/session.store.js';
+import { UsersService } from '../src/modules/users/users.service.js';
+import { AuditService } from '../src/modules/audit/audit.service.js';
+import { ConnectionRegistry } from '../src/modules/connections/connection.registry.js';
+import { ConnectionsService } from '../src/modules/connections/connections.service.js';
+import { ConnectionReaper } from '../src/modules/connections/connection.reaper.js';
+import { FakePlatform } from '../src/platforms/fake.platform.js';
+import { createPlatform } from '../src/platforms/platform.factory.js';
+import type { PlatformFactory, PlatformName } from '../src/platforms/platform.types.js';
+import type { User } from '../src/generated/prisma/client.js';
+import { MemoryUserRepository } from './helpers/users.js';
+
+const password = 'Connection-test-password-123';
+async function fixture(factory?: (now: () => number) => PlatformFactory) {
+  let time = 0;
+  const now = () => time;
+  const hasher = new BcryptPasswordHasher(4);
+  const passwordHash = await hasher.hash(password);
+  const user = (name: string): User => ({id: randomUUID(), email: `${name}@example.com`, passwordHash,
+    role: name === 'admin' ? 'admin' : 'user', isActive: true, mustChangePassword: false,
+    createdAt: new Date(), lastLoginAt: null});
+  const a = user('a'); const b = user('b'); const admin = user('admin');
+  const users = new MemoryUserRepository([a, b, admin]);
+  const sessions = new SessionStore(now);
+  const events: Array<{userId: string; action: string; platform?: string; targetUserId?: string}> = [];
+  const audit = new AuditService({async insert(userId, action, platform, targetUserId) { events.push({userId, action, platform, targetUserId}); }});
+  const connectionRegistry = new ConnectionRegistry(now);
+  const connections = new ConnectionsService(connectionRegistry, factory?.(now) ?? (name => createPlatform(name, {now})), audit, users, sessions);
+  const auth = new AuthService(users, hasher, audit, sessions, connections);
+  const userManagement = new UsersService(users, hasher, audit, sessions, connections);
+  const reaper = new ConnectionReaper(connectionRegistry, connections, 600_000, now);
+  const server = createApp({users, sessions, auth, userManagement, connections, connectionRegistry,
+    cookieSecret: 's'.repeat(48), production: false}).listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const request = (method: string, path: string, cookie = '', body?: unknown) => fetch(`http://127.0.0.1:${address.port}${path}`, {
+    method, headers: {'Content-Type': 'application/json', Cookie: cookie}, body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const login = async (user: User) => {
+    const response = await request('POST', '/auth/login', '', {email: user.email, password});
+    assert.equal(response.status, 200);
+    return response.headers.get('set-cookie')!.split(';')[0];
+  };
+  const start = async (cookie: string, platform: PlatformName = 'telegram') => {
+    const response = await request('POST', '/connections', cookie, {platform});
+    assert.equal(response.status, 201);
+    return await response.json() as {id: string; platform: PlatformName; status: string; qr?: string};
+  };
+  return {a, b, admin, users, sessions, auth, connections, connectionRegistry, events, reaper, request, login, start,
+    advance(ms: number) { time += ms; },
+    async close() {
+      await reaper.stop();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      await connections.shutdown();
+    },
+  };
+}
+
+test('fake platforms provide placeholder QR, scan transition, groups, and contact categories for both platforms', async () => {
+  let time = 0;
+  for (const name of ['telegram', 'whatsapp'] as const) {
+    const platform = createPlatform(name, {now: () => time});
+    assert.deepEqual(await platform.getStatus(), {status: 'disconnected'});
+    await platform.connect();
+    assert.deepEqual(await platform.getStatus(), {status: 'waiting-for-scan', qr: `FAKE_QR:${name}:scan-placeholder`});
+    await assert.rejects(platform.listGroups(), /not connected/);
+    time += 3_000;
+    assert.deepEqual(await platform.getStatus(), {status: 'connected'});
+    assert.equal((await platform.listGroups()).length, 2);
+    const categories = await platform.listContacts(['sample-group-1']);
+    assert.deepEqual(categories.map(item => item.category), name === 'telegram'
+      ? ['saved', 'unsaved_reachable', 'unsaved_unreachable'] : ['saved', 'unsaved']);
+    assert.ok(categories.every(item => item.contacts.length > 0));
+    await platform.disconnect();
+    assert.deepEqual(await platform.getStatus(), {status: 'disconnected'});
+  }
+});
+
+test('connection endpoints return waiting QR, connected status and groups, then delete cleanly', async () => {
+  const f = await fixture();
+  try {
+    const cookie = await f.login(f.a);
+    const started = await f.start(cookie);
+    assert.match(started.id, /^[a-f0-9]{64}$/);
+    assert.equal(started.status, 'waiting-for-scan');
+    assert.ok(started.qr);
+    assert.equal((await f.request('GET', `/connections/${started.id}/groups`, cookie)).status, 409);
+    f.advance(3_000);
+    const status = await f.request('GET', `/connections/${started.id}`, cookie);
+    assert.equal(status.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(await status.json(), {id: started.id, platform: 'telegram', status: 'connected'});
+    const groups = await f.request('GET', `/connections/${started.id}/groups`, cookie);
+    assert.equal(groups.status, 200);
+    assert.equal((await groups.json() as {groups: unknown[]}).groups.length, 2);
+    assert.equal((await f.request('DELETE', `/connections/${started.id}`, cookie)).status, 204);
+    assert.equal(f.connectionRegistry.get(started.id), undefined);
+    assert.equal((await f.request('GET', `/connections/${started.id}`, cookie)).status, 404);
+    const events = f.events.filter(event => event.action.startsWith('connection_'));
+    assert.deepEqual(events, [
+      {userId: f.a.id, action: 'connection_started', platform: 'telegram', targetUserId: undefined},
+      {userId: f.a.id, action: 'connection_ended', platform: 'telegram', targetUserId: undefined},
+    ]);
+    assert.equal(JSON.stringify(events).includes(started.qr!), false);
+    assert.doesNotMatch(JSON.stringify(events), /contact|phone|username|qr/i);
+  } finally { await f.close(); }
+});
+
+test('user B gets identical 404 responses for user A connections and missing IDs on every owned route', async () => {
+  const f = await fixture();
+  try {
+    const cookieA = await f.login(f.a); const cookieB = await f.login(f.b);
+    const started = await f.start(cookieA);
+    f.advance(5_000);
+    for (const [method, suffix] of [['GET', ''], ['GET', '/groups'], ['DELETE', '']]) {
+      for (const id of [started.id, 'missing']) {
+        const response = await f.request(method, `/connections/${id}${suffix}`, cookieB);
+        assert.equal(response.status, 404);
+        assert.deepEqual(await response.json(), {message: 'connection not found'});
+      }
+    }
+    assert.equal(f.connectionRegistry.get(started.id)!.lastActivity, 0);
+    assert.equal((await f.request('GET', `/connections/${started.id}`, cookieA)).status, 200);
+    assert.equal(f.connectionRegistry.get(started.id)!.lastActivity, 5_000);
+  } finally { await f.close(); }
+});
+
+test('starting another connection disconnects and replaces the existing one', async () => {
+  const f = await fixture();
+  try {
+    const cookie = await f.login(f.a);
+    const first = await f.start(cookie);
+    const oldPlatform = f.connectionRegistry.get(first.id)!.platform;
+    const second = await f.start(cookie, 'whatsapp');
+    assert.notEqual(first.id, second.id);
+    assert.deepEqual(await oldPlatform.getStatus(), {status: 'disconnected'});
+    assert.equal(f.connectionRegistry.get(first.id), undefined);
+    assert.equal(f.connectionRegistry.entries().length, 1);
+    assert.deepEqual(f.events.filter(event => event.action.startsWith('connection_')).map(event => [event.action, event.platform]), [
+      ['connection_started', 'telegram'], ['connection_ended', 'telegram'], ['connection_started', 'whatsapp'],
+    ]);
+  } finally { await f.close(); }
+});
+
+test('concurrent starts are serialized and never leave multiple live platforms for one user', async () => {
+  let active = 0; let peak = 0;
+  const f = await fixture(now => name => {
+    class TrackedPlatform extends FakePlatform {
+      override async connect() { await Promise.resolve(); active++; peak = Math.max(peak, active); await super.connect(); }
+      override async disconnect() { active--; await super.disconnect(); }
+    }
+    return new TrackedPlatform(name, {now});
+  });
+  try {
+    const sessionId = f.sessions.create(f.a.id);
+    const results = await Promise.all([
+      f.connections.start(f.a.id, 'telegram', sessionId),
+      f.connections.start(f.a.id, 'whatsapp', sessionId),
+      f.connections.start(f.a.id, 'telegram', sessionId),
+    ]);
+    assert.equal(new Set(results.map(result => result.id)).size, 3);
+    assert.equal(peak, 1);
+    assert.equal(active, 1);
+    assert.equal(f.connectionRegistry.entries().length, 1);
+  } finally { await f.close(); }
+  assert.equal(active, 0);
+});
+
+test('fake-clock reaper expires only idle connections; status and groups refresh activity', async () => {
+  const f = await fixture();
+  try {
+    const cookieA = await f.login(f.a); const cookieB = await f.login(f.b);
+    const a = await f.start(cookieA); const b = await f.start(cookieB, 'whatsapp');
+    const oldA = f.connectionRegistry.get(a.id)!.platform;
+    f.advance(600_000);
+    await f.reaper.runOnce();
+    assert.equal(f.connectionRegistry.entries().length, 2);
+    assert.equal((await f.request('GET', `/connections/${b.id}`, cookieB)).status, 200);
+    f.advance(1);
+    await f.reaper.runOnce();
+    assert.equal(f.connectionRegistry.get(a.id), undefined);
+    assert.deepEqual(await oldA.getStatus(), {status: 'disconnected'});
+    assert.ok(f.connectionRegistry.get(b.id));
+    f.advance(500_000);
+    assert.equal((await f.request('GET', `/connections/${b.id}/groups`, cookieB)).status, 200);
+    f.advance(200_000);
+    await f.reaper.runOnce();
+    assert.ok(f.connectionRegistry.get(b.id));
+    f.advance(400_001);
+    await f.reaper.runOnce();
+    assert.equal(f.connectionRegistry.entries().length, 0);
+    assert.equal(f.events.filter(event => event.action === 'connection_ended').length, 2);
+  } finally { await f.close(); }
+});
+
+test('logout destroys the user connection while preserving other users connections', async () => {
+  const f = await fixture();
+  try {
+    const cookieA = await f.login(f.a); const cookieB = await f.login(f.b);
+    const a = await f.start(cookieA); const b = await f.start(cookieB);
+    const platform = f.connectionRegistry.get(a.id)!.platform;
+    assert.equal((await f.request('POST', '/auth/logout', cookieA)).status, 200);
+    assert.deepEqual(await platform.getStatus(), {status: 'disconnected'});
+    assert.equal(f.connectionRegistry.get(a.id), undefined);
+    assert.ok(f.connectionRegistry.get(b.id));
+    assert.equal((await f.request('GET', `/connections/${a.id}`, cookieA)).status, 401);
+    assert.deepEqual(f.events.filter(event => event.userId === f.a.id).slice(-2).map(event => event.action), ['connection_ended', 'logout']);
+  } finally { await f.close(); }
+});
+
+for (const action of ['disable', 'reset-password'] as const) {
+  test(`admin ${action} destroys the target connection and invalidates its session`, async () => {
+    const f = await fixture();
+    try {
+      const cookie = await f.login(f.a); const adminCookie = await f.login(f.admin);
+      const started = await f.start(cookie);
+      const platform = f.connectionRegistry.get(started.id)!.platform;
+      const response = await f.request('POST', `/admin/users/${f.a.id}/${action}`, adminCookie);
+      assert.equal(response.status, 200);
+      assert.equal(f.connectionRegistry.get(started.id), undefined);
+      assert.deepEqual(await platform.getStatus(), {status: 'disconnected'});
+      assert.equal((await f.request('GET', `/connections/${started.id}`, cookie)).status, 401);
+      assert.equal(f.events.filter(event => event.action === 'connection_ended').length, 1);
+    } finally { await f.close(); }
+  });
+}
+
+test('connection routes reject missing auth, temporary passwords, and invalid platform input', async () => {
+  const f = await fixture();
+  try {
+    assert.equal((await f.request('POST', '/connections', '', {platform: 'telegram'})).status, 401);
+    const cookie = await f.login(f.a);
+    for (const body of [{platform: 'other'}, {}, {platform: 'telegram', ownerId: f.b.id}]) {
+      assert.equal((await f.request('POST', '/connections', cookie, body)).status, 400);
+    }
+    f.a.mustChangePassword = true;
+    assert.equal((await f.request('POST', '/connections', cookie, {platform: 'telegram'})).status, 403);
+    assert.equal(f.connectionRegistry.entries().length, 0);
+  } finally { await f.close(); }
+});
+
+test('reaper schedules every minute, avoids duplicate timers and clears its timer on stop', async (t) => {
+  const f = await fixture();
+  try {
+    let callback: (() => void) | undefined;
+    const handle = {unref() {}};
+    const schedule = t.mock.method(globalThis, 'setInterval', (fn: () => void, milliseconds: number) => {
+      assert.equal(milliseconds, 60_000); callback = fn; return handle;
+    });
+    const clear = t.mock.method(globalThis, 'clearInterval', () => {});
+    f.reaper.start(); f.reaper.start();
+    assert.equal(schedule.mock.callCount(), 1);
+    assert.ok(callback);
+    callback();
+    await f.reaper.stop();
+    assert.equal(clear.mock.callCount(), 1);
+    assert.equal(clear.mock.calls[0].arguments[0], handle);
+  } finally { t.mock.restoreAll(); await f.close(); }
+});
+
+test('shutdown disconnects live platforms and prevents new starts', async () => {
+  const f = await fixture();
+  try {
+    const sessionId = f.sessions.create(f.a.id);
+    const started = await f.connections.start(f.a.id, 'telegram', sessionId);
+    const platform = f.connectionRegistry.get(started.id)!.platform;
+    await f.connections.shutdown();
+    assert.equal(f.connectionRegistry.entries().length, 0);
+    assert.deepEqual(await platform.getStatus(), {status: 'disconnected'});
+    await assert.rejects(f.connections.start(f.a.id, 'whatsapp', sessionId), /shutting down/);
+  } finally { await f.close(); }
+});
+
+test('logout during an asynchronous connect cannot leave an orphan connection', async () => {
+  let entered!: () => void; let release!: () => void;
+  const connecting = new Promise<void>(resolve => { entered = resolve; });
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  let platform!: FakePlatform;
+  const f = await fixture(now => name => {
+    class SlowPlatform extends FakePlatform {
+      override async connect() { await super.connect(); entered(); await blocked; }
+    }
+    platform = new SlowPlatform(name, {now});
+    return platform;
+  });
+  try {
+    const sessionId = f.sessions.create(f.a.id);
+    const start = f.connections.start(f.a.id, 'telegram', sessionId);
+    const rejected = assert.rejects(start, /authentication required/);
+    await connecting;
+    const logout = f.auth.logout(sessionId, f.a.id);
+    release();
+    await rejected; await logout;
+    assert.equal(f.connectionRegistry.entries().length, 0);
+    assert.deepEqual(await platform.getStatus(), {status: 'disconnected'});
+    assert.equal(f.events.filter(event => event.action === 'connection_started').length, 0);
+  } finally { release(); await f.close(); }
+});
+
+test('stopping the reaper awaits in-flight disconnection and overlapping runs share the same work', async () => {
+  let entered!: () => void; let release!: () => void;
+  const disconnecting = new Promise<void>(resolve => { entered = resolve; });
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const f = await fixture(now => name => {
+    class SlowDisconnect extends FakePlatform {
+      override async disconnect() { entered(); await blocked; await super.disconnect(); }
+    }
+    return new SlowDisconnect(name, {now});
+  });
+  try {
+    const sessionId = f.sessions.create(f.a.id);
+    await f.connections.start(f.a.id, 'telegram', sessionId);
+    f.advance(600_001);
+    const first = f.reaper.runOnce();
+    assert.equal(f.reaper.runOnce(), first);
+    await disconnecting;
+    let stopped = false;
+    const stopping = f.reaper.stop().then(() => { stopped = true; });
+    await Promise.resolve();
+    assert.equal(stopped, false);
+    release();
+    await stopping;
+    assert.equal(f.connectionRegistry.entries().length, 0);
+    assert.equal(f.events.filter(event => event.action === 'connection_ended').length, 1);
+  } finally { release(); await f.close(); }
+});
+
+test('platform failures never log QR values or contact details', async (t) => {
+  const logger = t.mock.method(console, 'error', () => {});
+  const secret = 'FAKE_QR:private-phone-and-contact';
+  const f = await fixture(now => name => {
+    class FailingPlatform extends FakePlatform {
+      override async listGroups(): Promise<Array<{id: string; title: string}>> { throw new Error(secret); }
+    }
+    return new FailingPlatform(name, {now});
+  });
+  try {
+    const cookie = await f.login(f.a);
+    const connection = await f.start(cookie);
+    f.advance(3_000);
+    const response = await f.request('GET', `/connections/${connection.id}/groups`, cookie);
+    assert.equal(response.status, 500);
+    assert.equal((await response.text()).includes(secret), false);
+    assert.equal(logger.mock.callCount(), 1);
+    assert.equal(JSON.stringify(logger.mock.calls.map(call => call.arguments)).includes(secret), false);
+    assert.equal(JSON.stringify(f.events).includes(secret), false);
+  } finally { await f.close(); }
+});

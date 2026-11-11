@@ -6,6 +6,7 @@ import type { SessionStore } from '../auth/session.store.js';
 import { emailSchema } from '../auth/auth.validation.js';
 import type { AuditService } from '../audit/audit.service.js';
 import type { AdminUserRepository } from './users.repository.js';
+import type { ConnectionsService } from '../connections/connections.service.js';
 
 export function publicAdminUser(user: User) {
   return {
@@ -21,11 +22,11 @@ export class UsersService {
     private readonly hasher: PasswordHasher,
     private readonly audit: AuditService,
     private readonly sessions: SessionStore,
+    private readonly connections: Pick<ConnectionsService, 'destroyForUser'>,
   ) {}
 
-  async list(actorId: string) {
+  async list() {
     const users = await this.users.list();
-    await this.audit.record(actorId, 'admin_users_listed');
     return users.map(publicAdminUser);
   }
 
@@ -44,6 +45,7 @@ export class UsersService {
     const temporaryPassword = randomBytes(24).toString('base64url');
     const user = await this.users.resetPassword(userId, await this.hasher.hash(temporaryPassword));
     this.sessions.removeForUser(userId);
+    await this.connections.destroyForUser(userId);
     await this.audit.record(actorId, 'admin_password_reset', undefined, userId);
     return { user: publicAdminUser(user), temporaryPassword };
   }
@@ -51,7 +53,10 @@ export class UsersService {
   async setActive(actorId: string, userId: string, isActive: boolean) {
     if (!isActive && actorId === userId) throw new AppError(400, 'you cannot disable your own account');
     const user = await this.users.setActive(userId, isActive);
-    if (!isActive) this.sessions.removeForUser(userId);
+    if (!isActive) {
+      this.sessions.removeForUser(userId);
+      await this.connections.destroyForUser(userId);
+    }
     await this.audit.record(actorId, isActive ? 'admin_user_enabled' : 'admin_user_disabled', undefined, userId);
     return publicAdminUser(user);
   }

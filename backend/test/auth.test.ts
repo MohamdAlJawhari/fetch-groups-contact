@@ -12,6 +12,7 @@ import { errorHandler } from '../src/middleware/errorHandler.js';
 import type { User } from '../src/generated/prisma/client.js';
 import { UsersService } from '../src/modules/users/users.service.js';
 import { MemoryUserRepository } from './helpers/users.js';
+import { createConnectionServices } from './helpers/connections.js';
 
 const password = 'initial-password-123';
 const changedPassword = 'replacement-password-456';
@@ -25,9 +26,10 @@ async function fixture(options: { production?: boolean; ipLimit?: number; emailI
   const audit: Array<{ userId: string; action: string }> = [];
   const sessions = new SessionStore(() => time);
   const auditService = new AuditService({ async insert(userId, action) { audit.push({ userId, action }); } });
-  const auth = new AuthService(users, hasher, auditService, sessions);
-  const userManagement = new UsersService(users, hasher, auditService, sessions);
-  const app = createApp({ users, auth, sessions, userManagement, production: options.production ?? false, cookieSecret: 's'.repeat(48),
+  const lifecycle = createConnectionServices(users, sessions, auditService, {now: () => time});
+  const auth = new AuthService(users, hasher, auditService, sessions, lifecycle.connections);
+  const userManagement = new UsersService(users, hasher, auditService, sessions, lifecycle.connections);
+  const app = createApp({ users, auth, sessions, userManagement, ...lifecycle, production: options.production ?? false, cookieSecret: 's'.repeat(48),
     loginLimiter: createLoginRateLimiter({ ipLimit: options.ipLimit ?? 100, emailIpLimit: options.emailIpLimit ?? 100, emailLimit: options.emailLimit ?? 100, now: () => time }) });
   app.get('/protected', requireAuth(sessions, users), (_request, response) => response.json({ok: true}));
   app.use(errorHandler);

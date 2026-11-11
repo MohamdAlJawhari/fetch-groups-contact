@@ -10,6 +10,7 @@ import { UsersService } from '../src/modules/users/users.service.js';
 import { AuditService } from '../src/modules/audit/audit.service.js';
 import type { User } from '../src/generated/prisma/client.js';
 import { MemoryUserRepository } from './helpers/users.js';
+import { createConnectionServices } from './helpers/connections.js';
 
 const initialPassword = 'Initial-user-password-123';
 
@@ -24,9 +25,10 @@ async function fixture() {
   const sessions = new SessionStore();
   const records: Array<{userId: string; action: string; platform?: string; targetUserId?: string}> = [];
   const audit = new AuditService({async insert(userId, action, platform, targetUserId) { records.push({userId, action, platform, targetUserId}); }});
-  const userManagement = new UsersService(users, hasher, audit, sessions);
-  const auth = new AuthService(users, hasher, audit, sessions);
-  const server = createApp({users, sessions, auth, userManagement, cookieSecret: 's'.repeat(48), production: false}).listen(0, '127.0.0.1');
+  const lifecycle = createConnectionServices(users, sessions, audit);
+  const userManagement = new UsersService(users, hasher, audit, sessions, lifecycle.connections);
+  const auth = new AuthService(users, hasher, audit, sessions, lifecycle.connections);
+  const server = createApp({users, sessions, auth, userManagement, ...lifecycle, cookieSecret: 's'.repeat(48), production: false}).listen(0, '127.0.0.1');
   await once(server, 'listening');
   const address = server.address();
   assert.ok(address && typeof address !== 'string');
@@ -53,6 +55,33 @@ function routes(id: string): Array<[string, string, unknown?]> {
 }
 
 function assertNoHash(value: unknown) { assert.doesNotMatch(JSON.stringify(value), /passwordHash|password_hash|\$2[aby]\$/); }
+
+test('creation and login normalize email capitalization and surrounding spaces identically', async () => {
+  const f = await fixture();
+  try {
+    const adminCookie = await f.login(f.admin);
+    const created = await f.request('POST', '/admin/users', {email: ' Mixed.Case@EXAMPLE.COM '}, adminCookie);
+    assert.equal(created.status, 201);
+    const result = await created.json() as {user: User; temporaryPassword: string};
+    assert.equal(result.user.email, 'mixed.case@example.com');
+    for (const email of ['MIXED.CASE@example.com', ' mixed.CASE@Example.COM ']) {
+      const login = await f.request('POST', '/auth/login', {email, password: result.temporaryPassword});
+      assert.equal(login.status, 200);
+      assert.equal((await login.json() as {user: User}).user.id, result.user.id);
+    }
+    assert.equal((await f.request('POST', '/admin/users', {email: ' MIXED.CASE@EXAMPLE.COM '}, adminCookie)).status, 409);
+  } finally { await f.close(); }
+});
+
+test('listing users does not write an audit event', async () => {
+  const f = await fixture();
+  try {
+    const cookie = await f.login(f.admin);
+    const before = [...f.records];
+    for (let i = 0; i < 2; i++) assert.equal((await f.request('GET', '/admin/users', undefined, cookie)).status, 200);
+    assert.deepEqual(f.records, before);
+  } finally { await f.close(); }
+});
 
 test('a normal user is rejected on every admin route without side effects', async () => {
   const f = await fixture();
@@ -109,8 +138,10 @@ test('admin creates a normalized user with a random temporary password and lists
     const second = await f.request('POST', '/admin/users', {email: 'second@example.com'}, cookie);
     const secondResult = await second.json() as {temporaryPassword: string};
     assert.notEqual(secondResult.temporaryPassword, result.temporaryPassword);
+    const auditCountBeforeList = f.records.length;
     const listed = await f.request('GET', '/admin/users', undefined, cookie);
     assert.equal(listed.status, 200);
+    assert.equal(f.records.length, auditCountBeforeList);
     assert.equal(listed.headers.get('cache-control'), 'no-store');
     const list = await listed.json() as {users: User[]};
     assert.equal(list.users.length, 4);
@@ -120,7 +151,6 @@ test('admin creates a normalized user with a random temporary password and lists
     const newCookie = await f.login(stored, result.temporaryPassword);
     assert.equal((await f.request('GET', '/admin/users', undefined, newCookie)).status, 403);
     assert.ok(f.records.some(record => record.userId === f.admin.id && record.action === 'admin_user_created' && record.targetUserId === result.user.id));
-    assert.ok(f.records.some(record => record.userId === f.admin.id && record.action === 'admin_users_listed' && record.targetUserId === undefined));
     assert.equal(JSON.stringify(f.records).includes(result.temporaryPassword), false);
   } finally { await f.close(); }
 });

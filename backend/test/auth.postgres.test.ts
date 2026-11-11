@@ -15,6 +15,7 @@ import { AuthService } from '../src/modules/auth/auth.service.js';
 import { SessionStore } from '../src/modules/auth/session.store.js';
 import { createApp } from '../src/app.js';
 import { UsersService } from '../src/modules/users/users.service.js';
+import { createConnectionServices } from './helpers/connections.js';
 
 function run(args: string[], env: NodeJS.ProcessEnv) {
   return new Promise<{ code: number | null; output: string }>((resolve, reject) => {
@@ -64,9 +65,10 @@ test('PostgreSQL: first-admin CLI, real repositories, password change, audit row
       const sessions = new SessionStore();
       const hasher = new BcryptPasswordHasher(4);
       const auditService = new AuditService(new PrismaAuditRepository(db));
-      const auth = new AuthService(users, hasher, auditService, sessions);
-      const userManagement = new UsersService(users, hasher, auditService, sessions);
-      server = createApp({users, sessions, auth, userManagement, cookieSecret: 's'.repeat(48), production: false}).listen(0, '127.0.0.1');
+      const lifecycle = createConnectionServices(users, sessions, auditService);
+      const auth = new AuthService(users, hasher, auditService, sessions, lifecycle.connections);
+      const userManagement = new UsersService(users, hasher, auditService, sessions, lifecycle.connections);
+      server = createApp({users, sessions, auth, userManagement, ...lifecycle, cookieSecret: 's'.repeat(48), production: false}).listen(0, '127.0.0.1');
       await once(server, 'listening');
       const address = server.address();
       assert.ok(address && typeof address !== 'string');
@@ -127,7 +129,8 @@ test('PostgreSQL: first-admin CLI, real repositories, password change, audit row
       assert.deepEqual(racing.map(response => response.status).sort(), [201, 409]);
       assert.equal(await db.user.count({where: {email: 'race@example.com'}}), 1);
       const racedUser = await db.user.findUniqueOrThrow({where: {email: 'race@example.com'}});
-      let userLogin = await post('login', {email: target.email, password: createdBody.temporaryPassword});
+      let userLogin = await post('login', {email: ` ${target.email.toUpperCase()} `, password: createdBody.temporaryPassword});
+      assert.equal(userLogin.status, 200);
       let userCookie = userLogin.headers.get('set-cookie')!.split(';')[0];
       assert.equal((await post('change-password', {currentPassword: createdBody.temporaryPassword, newPassword: 'User-test-password-123'}, userCookie)).status, 200);
       userLogin = await post('login', {email: target.email, password: 'User-test-password-123'});
@@ -136,6 +139,11 @@ test('PostgreSQL: first-admin CLI, real repositories, password change, audit row
         ['GET', ''], ['POST', ''], ['POST', `/${target.id}/reset-password`],
         ['POST', `/${target.id}/enable`], ['POST', `/${target.id}/disable`],
       ]) assert.equal((await adminRequest(method, path, method === 'POST' ? {email: 'blocked@example.com'} : undefined, userCookie)).status, 403);
+      const connectionResponse = await fetch(`http://127.0.0.1:${address.port}/connections`, {
+        method: 'POST', headers: {'Content-Type': 'application/json', Cookie: userCookie}, body: JSON.stringify({platform: 'telegram'}),
+      });
+      assert.equal(connectionResponse.status, 201);
+      const connectionId = (await connectionResponse.json() as {id: string}).id;
       const reset = await adminRequest('POST', `/${target.id}/reset-password`);
       assert.equal(reset.status, 200);
       const resetBody = await reset.json() as {temporaryPassword: string};
@@ -143,6 +151,11 @@ test('PostgreSQL: first-admin CLI, real repositories, password change, audit row
       assert.equal(resetTarget.mustChangePassword, true);
       assert.equal(await hasher.verify(resetBody.temporaryPassword, resetTarget.passwordHash), true);
       assert.equal((await post('logout', {}, userCookie)).status, 401);
+      assert.equal(lifecycle.connectionRegistry.get(connectionId), undefined);
+      const connectionEvents = await db.auditLog.findMany({where: {userId: target.id, action: {startsWith: 'connection_'}}, orderBy: {id: 'asc'}});
+      assert.deepEqual(connectionEvents.map(event => [event.action, event.platform, event.targetUserId]), [
+        ['connection_started', 'telegram', null], ['connection_ended', 'telegram', null],
+      ]);
       userLogin = await post('login', {email: target.email, password: resetBody.temporaryPassword});
       userCookie = userLogin.headers.get('set-cookie')!.split(';')[0];
       assert.equal((await adminRequest('POST', `/${target.id}/disable`)).status, 200);
@@ -159,11 +172,11 @@ test('PostgreSQL: first-admin CLI, real repositories, password change, audit row
       const adminEvents = await db.auditLog.findMany({where: {userId: stored.id, action: {startsWith: 'admin_'}}, orderBy: {id: 'asc'}});
       assert.deepEqual(adminEvents.map(event => event.action), [
         'admin_user_created', 'admin_user_created', 'admin_password_reset',
-        'admin_user_disabled', 'admin_user_enabled', 'admin_users_listed',
+        'admin_user_disabled', 'admin_user_enabled',
       ]);
       assert.ok(adminEvents.every(event => event.platform === null));
       assert.deepEqual(adminEvents.map(event => event.targetUserId), [
-        target.id, racedUser.id, target.id, target.id, target.id, null,
+        target.id, racedUser.id, target.id, target.id, target.id,
       ]);
       await db.user.update({where: {id: stored.id}, data: {isActive: false}});
       assert.equal((await post('logout', {}, third.headers.get('set-cookie')!.split(';')[0])).status, 401);

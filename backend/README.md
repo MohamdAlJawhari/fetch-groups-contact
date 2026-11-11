@@ -1,6 +1,6 @@
 # Contact Export backend
 
-Requires Node.js 22.12+ and PostgreSQL. Authentication and admin user management are implemented; future platform and export modules remain empty.
+Requires Node.js 22.12+ and PostgreSQL. Authentication, admin user management, and the fake connection lifecycle are implemented. Telegram and WhatsApp both use `FakePlatform`; real platform integrations and export come later.
 
 From this folder, install dependencies with `npm ci`. Copy `.env.example` to `.env` if `.env` does not exist, then edit it:
 
@@ -69,7 +69,7 @@ Create and reset generate a fresh temporary password from 24 cryptographically r
 
 Create and reset set `mustChangePassword: true`. Reset removes all of the target user's sessions, including an admin's own sessions when they reset themselves. Disable also removes all target sessions; enable permits new logins but does not restore old sessions. Reset does not enable a disabled account. An admin cannot disable their own account (400).
 
-Each successful admin action records an audit event with the acting admin in `user_id`: `admin_users_listed`, `admin_user_created`, `admin_password_reset`, `admin_user_disabled`, or `admin_user_enabled`. Create, reset, enable, and disable record the affected user in nullable `target_user_id`, a foreign key to `users.id`. Listing users has no individual target, so that column is null. Existing records and authentication events also keep a null target. These events contain no passwords or hashes, and platform is null. Migration `20261111000000_add_audit_target_user` adds the target column without modifying historical records; apply it with `npm run db:deploy` when updating another environment.
+Each successful admin mutation records an audit event with the acting admin in `user_id`: `admin_user_created`, `admin_password_reset`, `admin_user_disabled`, or `admin_user_enabled`. Create, reset, enable, and disable record the affected user in nullable `target_user_id`, a foreign key to `users.id`. Listing users writes no audit event. Existing historical list events are retained. Authentication events keep a null target. These events contain no passwords or hashes, and platform is null. Migration `20261111000000_add_audit_target_user` adds the target column without modifying historical records; apply it with `npm run db:deploy` when updating another environment.
 
 Example using the PowerShell `$appSession` from login:
 
@@ -82,9 +82,41 @@ $created = Invoke-RestMethod -Uri 'http://localhost:3000/admin/users' `
 # $created.user contains the account; $created.temporaryPassword is returned once.
 ```
 
+## Fake connections
+
+All four routes require an active logged-in user who has changed their temporary password:
+
+| Method | Path | Body | Response |
+| --- | --- | --- | --- |
+| POST | `/connections` | `{"platform":"telegram"}` or `{"platform":"whatsapp"}` | 201 with `id`, `platform`, `status`, and placeholder `qr`. |
+| GET | `/connections/:id` | None | 200 with status; `qr` appears only while waiting for scan. |
+| GET | `/connections/:id/groups` | None | 200 with `{"groups":[{"id":"sample-group-1","title":"Sample team"},...]}` once connected; 409 while waiting. |
+| DELETE | `/connections/:id` | None | 204; disconnects the platform and removes the registry entry. |
+
+The fake QR is a placeholder string, not a scannable login code. The fake platform reports `waiting-for-scan` initially and `connected` after three seconds, using an injectable clock rather than a background scan timer. The platform interface exposes `connect`, `getStatus`, `listGroups`, `listContacts`, and `disconnect`. Fake Telegram contacts have `saved`, `unsaved_reachable`, and `unsaved_unreachable` categories. Fake WhatsApp contacts have `saved` and `unsaved` categories. Contacts remain internal to the platform interface; there is no contacts or export endpoint yet.
+
+The in-memory registry stores the owner, platform name, platform object, and last activity under an ID made from 32 cryptographically random bytes. Missing IDs and IDs owned by another user both return 404 with `{"message":"connection not found"}`. Only authorized accesses refresh activity. Starting a new connection disconnects and replaces the user's old connection, even across platform names. Operations are serialized per user to avoid concurrent replacements leaving multiple live platforms.
+
+The reaper checks every minute for connections idle longer than `CONNECTION_IDLE_TIMEOUT_MS` (default 600000, ten minutes). Status polling and group requests refresh the timeout; polling therefore keeps a connection alive. Logout, admin disable, password reset, and password change destroy that user's live connection too. Shutdown stops the reaper, waits for any pending sweep, and disconnects remaining platforms before closing PostgreSQL.
+
+Each start and end records `connection_started` or `connection_ended` under the connection owner's `user_id`, with `platform` set to `telegram` or `whatsapp` and no target. No QR values, contacts, groups, phone numbers, or connection IDs enter the audit events or error logs. All connection responses use `Cache-Control: no-store`. Connections are held in one process only and disappear on restart; no schema migration is needed for this feature.
+
+After logging in using PowerShell and saving the cookie in `$appSession`:
+
+```powershell
+$connection = Invoke-RestMethod -Uri 'http://localhost:3000/connections' `
+    -Method Post -ContentType 'application/json' `
+    -Body '{"platform":"telegram"}' -WebSession $appSession
+
+Start-Sleep -Seconds 3
+Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)" -WebSession $appSession
+Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)/groups" -WebSession $appSession
+Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)" -Method Delete -WebSession $appSession
+```
+
 ## Tests
 
-`npm test` runs the authentication, admin authorization, user management, and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
+`npm test` runs authentication, admin authorization, user management, email capitalization, connection ownership, concurrent replacement, cleanup, fake-clock reaper, and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
 
 ```powershell
 $env:RUN_DATABASE_TESTS = '1'

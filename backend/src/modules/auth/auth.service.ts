@@ -6,7 +6,8 @@ import type { UserRepository } from '../users/users.repository.js';
 import type { AuditService } from '../audit/audit.service.js';
 import type { PasswordHasher } from './password.hasher.js';
 import { SessionStore } from './session.store.js';
-import { newPasswordSchema, PASSWORD_REQUIREMENTS } from './auth.validation.js';
+import { emailSchema, newPasswordSchema, PASSWORD_REQUIREMENTS } from './auth.validation.js';
+import type { ConnectionsService } from '../connections/connections.service.js';
 
 export function publicUser(user: User): AuthenticatedUser {
   return { id: user.id, email: user.email, role: user.role, mustChangePassword: user.mustChangePassword };
@@ -19,11 +20,14 @@ export class AuthService {
     private readonly hasher: PasswordHasher,
     private readonly audit: AuditService,
     private readonly sessions: SessionStore,
+    private readonly connections: Pick<ConnectionsService, 'destroyForUser'>,
   ) {
     this.dummyHash = hasher.hash(randomBytes(24).toString('hex'));
   }
   async login(email: string, password: string, previousSessionId?: string) {
-    const user = await this.users.findByEmail(email);
+    const parsed = emailSchema.safeParse(email);
+    if (!parsed.success) throw new AppError(401, LOGIN_FAILURE);
+    const user = await this.users.findByEmail(parsed.data);
     const valid = await this.hasher.verify(password, user?.passwordHash ?? await this.dummyHash);
     if (!user || !valid || !user.isActive) throw new AppError(401, LOGIN_FAILURE);
     await this.users.setLastLogin(user.id);
@@ -33,6 +37,7 @@ export class AuthService {
   }
   async logout(sessionId: string, userId: string) {
     this.sessions.remove(sessionId);
+    await this.connections.destroyForUser(userId);
     await this.audit.record(userId, 'logout');
   }
   async changePassword(userId: string, currentPassword: string, newPassword: string) {
@@ -49,6 +54,7 @@ export class AuthService {
     }
     await this.users.changePassword(userId, await this.hasher.hash(newPassword));
     this.sessions.removeForUser(userId);
+    await this.connections.destroyForUser(userId);
     await this.audit.record(userId, 'password_changed');
   }
 }

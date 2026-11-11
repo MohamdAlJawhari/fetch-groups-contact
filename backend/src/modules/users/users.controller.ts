@@ -15,7 +15,7 @@ export class UsersController {
     return parsed.data;
   }
   list = async (request: Request, response: Response) => {
-    response.json({ users: await this.users.list(request.user!.id) });
+    response.json({ users: await this.users.list() });
   };
   create = async (request: Request, response: Response) => {
     const parsed = createUserSchema.safeParse(request.body);
