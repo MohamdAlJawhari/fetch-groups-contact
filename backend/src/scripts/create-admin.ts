@@ -3,7 +3,7 @@ import { Writable } from 'node:stream';
 import { createInterface } from 'node:readline/promises';
 import { prisma } from '../database/prisma.js';
 import { BcryptPasswordHasher } from '../modules/auth/password.hasher.js';
-import { emailSchema, newPasswordSchema } from '../modules/auth/auth.validation.js';
+import { emailSchema, newPasswordSchema, PASSWORD_REQUIREMENTS } from '../modules/auth/auth.validation.js';
 
 async function readPassword(): Promise<string> {
   if (process.env.ADMIN_PASSWORD) return process.env.ADMIN_PASSWORD;
@@ -30,7 +30,7 @@ async function main() {
   const email = emailSchema.safeParse(values.email);
   if (!email.success) throw new Error('Usage: npm run admin:create -- --email admin@example.com');
   const password = newPasswordSchema.safeParse(await readPassword());
-  if (!password.success) throw new Error('Password must have at least 12 characters and at most 72 UTF-8 bytes.');
+  if (!password.success) throw new Error(PASSWORD_REQUIREMENTS);
   const passwordHash = await new BcryptPasswordHasher().hash(password.data);
   await prisma.$transaction(async (tx) => {
     if (await tx.user.count({ where: { role: 'admin' } })) {

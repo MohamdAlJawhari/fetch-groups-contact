@@ -2,7 +2,7 @@ import type { CookieOptions, Request, Response } from 'express';
 import { AppError, LOGIN_FAILURE } from '../../shared/errors.js';
 import type { AuthService } from './auth.service.js';
 import { SESSION_COOKIE, SESSION_TTL_MS } from './session.store.js';
-import { changePasswordSchema, loginSchema } from './auth.validation.js';
+import { changePasswordSchema, loginSchema, PASSWORD_REQUIREMENTS } from './auth.validation.js';
 
 export class AuthController {
   private readonly cookieOptions: CookieOptions;
@@ -26,7 +26,7 @@ export class AuthController {
   changePassword = async (request: Request, response: Response) => {
     const parsed = changePasswordSchema.safeParse(request.body);
     if (!parsed.success) {
-      throw new AppError(400, 'provide currentPassword and a newPassword of at least 12 characters and at most 72 UTF-8 bytes');
+      throw new AppError(400, `provide currentPassword and newPassword. ${PASSWORD_REQUIREMENTS}`);
     }
     await this.auth.changePassword(request.user!.id, parsed.data.currentPassword, parsed.data.newPassword);
     response.clearCookie(SESSION_COOKIE, this.cookieOptions);

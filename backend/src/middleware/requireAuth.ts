@@ -4,7 +4,11 @@ import { publicUser } from '../modules/auth/auth.service.js';
 import { SESSION_COOKIE, SessionStore } from '../modules/auth/session.store.js';
 import { AppError } from '../shared/errors.js';
 
-export function requireAuth(sessions: SessionStore, users: UserRepository): RequestHandler {
+export function requireAuth(
+  sessions: SessionStore,
+  users: UserRepository,
+  options: { allowTemporaryPassword?: boolean } = {},
+): RequestHandler {
   return async (request, _response, next) => {
     const id = request.signedCookies?.[SESSION_COOKIE];
     const session = typeof id === 'string' ? sessions.get(id) : undefined;
@@ -13,6 +17,9 @@ export function requireAuth(sessions: SessionStore, users: UserRepository): Requ
     if (!user?.isActive) {
       sessions.remove(id);
       throw new AppError(401, 'authentication required');
+    }
+    if (user.mustChangePassword && !options.allowTemporaryPassword) {
+      throw new AppError(403, 'password change required');
     }
     request.user = publicUser(user);
     request.sessionId = id;

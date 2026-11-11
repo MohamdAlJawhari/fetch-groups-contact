@@ -6,6 +6,7 @@ import type { UserRepository } from '../users/users.repository.js';
 import type { AuditService } from '../audit/audit.service.js';
 import type { PasswordHasher } from './password.hasher.js';
 import { SessionStore } from './session.store.js';
+import { newPasswordSchema, PASSWORD_REQUIREMENTS } from './auth.validation.js';
 
 export function publicUser(user: User): AuthenticatedUser {
   return { id: user.id, email: user.email, role: user.role, mustChangePassword: user.mustChangePassword };
@@ -35,6 +36,9 @@ export class AuthService {
     await this.audit.record(userId, 'logout');
   }
   async changePassword(userId: string, currentPassword: string, newPassword: string) {
+    if (!newPasswordSchema.safeParse(newPassword).success) {
+      throw new AppError(400, PASSWORD_REQUIREMENTS);
+    }
     const user = await this.users.findById(userId);
     if (!user?.isActive) throw new AppError(401, 'authentication required');
     if (!(await this.hasher.verify(currentPassword, user.passwordHash))) {
@@ -45,5 +49,6 @@ export class AuthService {
     }
     await this.users.changePassword(userId, await this.hasher.hash(newPassword));
     this.sessions.removeForUser(userId);
+    await this.audit.record(userId, 'password_changed');
   }
 }
