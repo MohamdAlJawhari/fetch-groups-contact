@@ -10,7 +10,8 @@ import { createLoginRateLimiter } from '../src/middleware/loginRateLimiter.js';
 import { requireAuth } from '../src/middleware/requireAuth.js';
 import { errorHandler } from '../src/middleware/errorHandler.js';
 import type { User } from '../src/generated/prisma/client.js';
-import type { UserRepository } from '../src/modules/users/users.repository.js';
+import { UsersService } from '../src/modules/users/users.service.js';
+import { MemoryUserRepository } from './helpers/users.js';
 
 const password = 'initial-password-123';
 const changedPassword = 'replacement-password-456';
@@ -20,16 +21,13 @@ async function fixture(options: { production?: boolean; ipLimit?: number; emailI
   const hasher = new BcryptPasswordHasher(4);
   const user: User = { id: 'test-user', email: 'user@example.com', passwordHash: await hasher.hash(password),
     role: 'user', isActive: true, mustChangePassword: false, createdAt: new Date(), lastLoginAt: null };
-  const users: UserRepository = {
-    async findById(id) { return id === user.id ? user : null; },
-    async findByEmail(email) { return email === user.email ? user : null; },
-    async setLastLogin() { user.lastLoginAt = new Date(); },
-    async changePassword(_id, hash) { user.passwordHash = hash; user.mustChangePassword = false; },
-  };
+  const users = new MemoryUserRepository([user]);
   const audit: Array<{ userId: string; action: string }> = [];
   const sessions = new SessionStore(() => time);
-  const auth = new AuthService(users, hasher, new AuditService({ async insert(userId, action) { audit.push({ userId, action }); } }), sessions);
-  const app = createApp({ users, auth, sessions, production: options.production ?? false, cookieSecret: 's'.repeat(48),
+  const auditService = new AuditService({ async insert(userId, action) { audit.push({ userId, action }); } });
+  const auth = new AuthService(users, hasher, auditService, sessions);
+  const userManagement = new UsersService(users, hasher, auditService, sessions);
+  const app = createApp({ users, auth, sessions, userManagement, production: options.production ?? false, cookieSecret: 's'.repeat(48),
     loginLimiter: createLoginRateLimiter({ ipLimit: options.ipLimit ?? 100, emailIpLimit: options.emailIpLimit ?? 100, emailLimit: options.emailLimit ?? 100, now: () => time }) });
   app.get('/protected', requireAuth(sessions, users), (_request, response) => response.json({ok: true}));
   app.use(errorHandler);

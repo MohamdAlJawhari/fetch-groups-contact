@@ -1,6 +1,6 @@
 # Contact Export backend
 
-Requires Node.js 22.12+ and PostgreSQL. Authentication is implemented; future admin, platform, and export modules remain empty.
+Requires Node.js 22.12+ and PostgreSQL. Authentication and admin user management are implemented; future platform and export modules remain empty.
 
 From this folder, install dependencies with `npm ci`. Copy `.env.example` to `.env` if `.env` does not exist, then edit it:
 
@@ -51,9 +51,40 @@ The in-memory login limiter allows 5 failures per normalized email-and-IP pair, 
 
 `requireAuth` loads the user on every protected request and rejects missing, expired, tampered, deleted-user, and inactive-user sessions. By default it also rejects users with `mustChangePassword: true` with HTTP 403 and `{"message":"password change required"}`. Only `POST /auth/change-password` and `POST /auth/logout` explicitly use `requireAuth(..., { allowTemporaryPassword: true })`; session validation and the active-user check still apply there. Login remains public so users can obtain the session needed to change their temporary password. Health is public. Future protected routes using the default middleware inherit this gate. Changing the password clears the flag in PostgreSQL, removes all sessions including the current one, records `password_changed` without passwords or hashes, and expires the browser's session cookie, so the user must log in again.
 
+## Admin users
+
+All routes under `/admin/users` require a valid session for an active user with `role: "admin"` and `mustChangePassword: false`. Ordinary users receive 403 on every admin route; missing or invalid sessions receive 401. The role and password-change flag are loaded from PostgreSQL on every request.
+
+| Method | Path | Request body | Response |
+| --- | --- | --- | --- |
+| GET | `/admin/users` | None | `200 {"users":[...]}` |
+| POST | `/admin/users` | `{"email":"person@example.com"}` | `201 {"user":{...},"temporaryPassword":"..."}` |
+| POST | `/admin/users/:id/reset-password` | None | `200 {"user":{...},"temporaryPassword":"..."}` |
+| POST | `/admin/users/:id/disable` | None | `200 {"user":{...}}` |
+| POST | `/admin/users/:id/enable` | None | `200 {"user":{...}}` |
+
+`:id` must be a UUID. Invalid IDs or bodies return 400, missing users return 404, and duplicate emails return 409. Email addresses are trimmed and stored lowercase; the unique database index also prevents duplicates from simultaneous requests. New accounts always have role `user`; clients cannot submit a role or password on create.
+
+Create and reset generate a fresh temporary password from 24 cryptographically random bytes (32 base64url characters). Only its bcrypt hash is stored. The plaintext appears only in that successful response; copy it then, as listing users cannot retrieve it. All admin responses use `Cache-Control: no-store`. Password hashes are excluded from every response. Public user fields are `id`, `email`, `role`, `isActive`, `mustChangePassword`, `createdAt`, and `lastLoginAt`.
+
+Create and reset set `mustChangePassword: true`. Reset removes all of the target user's sessions, including an admin's own sessions when they reset themselves. Disable also removes all target sessions; enable permits new logins but does not restore old sessions. Reset does not enable a disabled account. An admin cannot disable their own account (400).
+
+Each successful admin action records an audit event with the acting admin in `user_id`: `admin_users_listed`, `admin_user_created`, `admin_password_reset`, `admin_user_disabled`, or `admin_user_enabled`. Create, reset, enable, and disable record the affected user in nullable `target_user_id`, a foreign key to `users.id`. Listing users has no individual target, so that column is null. Existing records and authentication events also keep a null target. These events contain no passwords or hashes, and platform is null. Migration `20261111000000_add_audit_target_user` adds the target column without modifying historical records; apply it with `npm run db:deploy` when updating another environment.
+
+Example using the PowerShell `$appSession` from login:
+
+```powershell
+Invoke-RestMethod -Uri 'http://localhost:3000/admin/users' -WebSession $appSession
+
+$body = @{ email = 'person@example.com' } | ConvertTo-Json
+$created = Invoke-RestMethod -Uri 'http://localhost:3000/admin/users' `
+    -Method Post -ContentType 'application/json' -Body $body -WebSession $appSession
+# $created.user contains the account; $created.temporaryPassword is returned once.
+```
+
 ## Tests
 
-`npm test` runs the authentication and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, and the admin CLI, run in PowerShell:
+`npm test` runs the authentication, admin authorization, user management, and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
 
 ```powershell
 $env:RUN_DATABASE_TESTS = '1'

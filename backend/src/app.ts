@@ -8,11 +8,15 @@ import { createAuthRoutes } from './modules/auth/auth.routes.js';
 import type { AuthService } from './modules/auth/auth.service.js';
 import type { SessionStore } from './modules/auth/session.store.js';
 import type { UserRepository } from './modules/users/users.repository.js';
+import type { UsersService } from './modules/users/users.service.js';
+import { UsersController } from './modules/users/users.controller.js';
+import { createUsersRoutes } from './modules/users/users.routes.js';
 
 export interface AppDependencies {
   auth: AuthService;
   sessions: SessionStore;
   users: UserRepository;
+  userManagement: UsersService;
   cookieSecret: string;
   production: boolean;
   loginLimiter?: express.RequestHandler;
@@ -31,6 +35,10 @@ export function createApp(dependencies: AppDependencies) {
     new AuthController(dependencies.auth, dependencies.production),
     dependencies.loginLimiter ?? createLoginRateLimiter(),
     requireAuth(dependencies.sessions, dependencies.users, { allowTemporaryPassword: true }),
+  ));
+  app.use('/admin/users', createUsersRoutes(
+    new UsersController(dependencies.userManagement),
+    requireAuth(dependencies.sessions, dependencies.users),
   ));
   app.use(errorHandler);
   return app;

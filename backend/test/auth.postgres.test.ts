@@ -14,6 +14,7 @@ import { BcryptPasswordHasher } from '../src/modules/auth/password.hasher.js';
 import { AuthService } from '../src/modules/auth/auth.service.js';
 import { SessionStore } from '../src/modules/auth/session.store.js';
 import { createApp } from '../src/app.js';
+import { UsersService } from '../src/modules/users/users.service.js';
 
 function run(args: string[], env: NodeJS.ProcessEnv) {
   return new Promise<{ code: number | null; output: string }>((resolve, reject) => {
@@ -61,8 +62,11 @@ test('PostgreSQL: first-admin CLI, real repositories, password change, audit row
       assert.equal(await db.user.count(), 1);
       const users = new PrismaUserRepository(db);
       const sessions = new SessionStore();
-      const auth = new AuthService(users, new BcryptPasswordHasher(4), new AuditService(new PrismaAuditRepository(db)), sessions);
-      server = createApp({users, sessions, auth, cookieSecret: 's'.repeat(48), production: false}).listen(0, '127.0.0.1');
+      const hasher = new BcryptPasswordHasher(4);
+      const auditService = new AuditService(new PrismaAuditRepository(db));
+      const auth = new AuthService(users, hasher, auditService, sessions);
+      const userManagement = new UsersService(users, hasher, auditService, sessions);
+      server = createApp({users, sessions, auth, userManagement, cookieSecret: 's'.repeat(48), production: false}).listen(0, '127.0.0.1');
       await once(server, 'listening');
       const address = server.address();
       assert.ok(address && typeof address !== 'string');
@@ -87,6 +91,7 @@ test('PostgreSQL: first-admin CLI, real repositories, password change, audit row
       const logs = await db.auditLog.findMany({where: {userId: stored.id}, orderBy: {id: 'asc'}});
       assert.deepEqual(logs.map(log => log.action), ['login', 'logout', 'login', 'password_changed', 'login', 'logout']);
       assert.ok(logs.every(log => log.platform === null));
+      assert.ok(logs.every(log => log.targetUserId === null));
       const loggedIn = await db.user.findUniqueOrThrow({where: {id: stored.id}});
       assert.ok(loggedIn.lastLoginAt);
       const second = await post('login', {email: stored.email, password});
@@ -98,6 +103,68 @@ test('PostgreSQL: first-admin CLI, real repositories, password change, audit row
       assert.equal((await post('login', {email: stored.email, password})).status, 401);
       const third = await post('login', {email: stored.email, password: replacement});
       assert.equal(third.status, 200);
+      const adminCookie = third.headers.get('set-cookie')!.split(';')[0];
+      const adminRequest = (method: string, path: string, body?: unknown, cookie = adminCookie) =>
+        fetch(`http://127.0.0.1:${address.port}/admin/users${path}`, {
+          method, headers: {'Content-Type': 'application/json', Cookie: cookie},
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
+      const createdUserResponse = await adminRequest('POST', '', {email: ' NEW@EXAMPLE.COM '});
+      assert.equal(createdUserResponse.status, 201);
+      const createdBody = await createdUserResponse.json() as {user: {id: string}; temporaryPassword: string};
+      assert.equal(JSON.stringify(createdBody).includes('passwordHash'), false);
+      const target = await db.user.findUniqueOrThrow({where: {id: createdBody.user.id}});
+      assert.equal(target.email, 'new@example.com');
+      assert.equal(target.role, 'user');
+      assert.equal(target.mustChangePassword, true);
+      assert.equal(await hasher.verify(createdBody.temporaryPassword, target.passwordHash), true);
+      const duplicateEmail = await adminRequest('POST', '', {email: 'NEW@EXAMPLE.COM'});
+      assert.equal(duplicateEmail.status, 409);
+      const racing = await Promise.all([
+        adminRequest('POST', '', {email: 'race@example.com'}),
+        adminRequest('POST', '', {email: ' RACE@EXAMPLE.COM '}),
+      ]);
+      assert.deepEqual(racing.map(response => response.status).sort(), [201, 409]);
+      assert.equal(await db.user.count({where: {email: 'race@example.com'}}), 1);
+      const racedUser = await db.user.findUniqueOrThrow({where: {email: 'race@example.com'}});
+      let userLogin = await post('login', {email: target.email, password: createdBody.temporaryPassword});
+      let userCookie = userLogin.headers.get('set-cookie')!.split(';')[0];
+      assert.equal((await post('change-password', {currentPassword: createdBody.temporaryPassword, newPassword: 'User-test-password-123'}, userCookie)).status, 200);
+      userLogin = await post('login', {email: target.email, password: 'User-test-password-123'});
+      userCookie = userLogin.headers.get('set-cookie')!.split(';')[0];
+      for (const [method, path] of [
+        ['GET', ''], ['POST', ''], ['POST', `/${target.id}/reset-password`],
+        ['POST', `/${target.id}/enable`], ['POST', `/${target.id}/disable`],
+      ]) assert.equal((await adminRequest(method, path, method === 'POST' ? {email: 'blocked@example.com'} : undefined, userCookie)).status, 403);
+      const reset = await adminRequest('POST', `/${target.id}/reset-password`);
+      assert.equal(reset.status, 200);
+      const resetBody = await reset.json() as {temporaryPassword: string};
+      const resetTarget = await db.user.findUniqueOrThrow({where: {id: target.id}});
+      assert.equal(resetTarget.mustChangePassword, true);
+      assert.equal(await hasher.verify(resetBody.temporaryPassword, resetTarget.passwordHash), true);
+      assert.equal((await post('logout', {}, userCookie)).status, 401);
+      userLogin = await post('login', {email: target.email, password: resetBody.temporaryPassword});
+      userCookie = userLogin.headers.get('set-cookie')!.split(';')[0];
+      assert.equal((await adminRequest('POST', `/${target.id}/disable`)).status, 200);
+      assert.equal((await db.user.findUniqueOrThrow({where: {id: target.id}})).isActive, false);
+      assert.equal((await post('logout', {}, userCookie)).status, 401);
+      assert.equal((await adminRequest('POST', `/${target.id}/enable`)).status, 200);
+      assert.equal((await db.user.findUniqueOrThrow({where: {id: target.id}})).isActive, true);
+      const list = await adminRequest('GET', '');
+      assert.equal(list.status, 200);
+      const listText = await list.text();
+      assert.doesNotMatch(listText, /passwordHash|password_hash|temporaryPassword|\$2[aby]\$/);
+      assert.equal(listText.includes(resetBody.temporaryPassword), false);
+      assert.equal((await adminRequest('POST', `/${stored.id}/disable`)).status, 400);
+      const adminEvents = await db.auditLog.findMany({where: {userId: stored.id, action: {startsWith: 'admin_'}}, orderBy: {id: 'asc'}});
+      assert.deepEqual(adminEvents.map(event => event.action), [
+        'admin_user_created', 'admin_user_created', 'admin_password_reset',
+        'admin_user_disabled', 'admin_user_enabled', 'admin_users_listed',
+      ]);
+      assert.ok(adminEvents.every(event => event.platform === null));
+      assert.deepEqual(adminEvents.map(event => event.targetUserId), [
+        target.id, racedUser.id, target.id, target.id, target.id, null,
+      ]);
       await db.user.update({where: {id: stored.id}, data: {isActive: false}});
       assert.equal((await post('logout', {}, third.headers.get('set-cookie')!.split(';')[0])).status, 401);
       const disabled = await post('login', {email: stored.email, password: replacement});
