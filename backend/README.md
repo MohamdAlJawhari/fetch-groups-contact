@@ -114,6 +114,10 @@ Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)/grou
 Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)" -Method Delete -WebSession $appSession
 ```
 
+## Export (in progress, step 5)
+
+`src/export/excel.writer.ts` (`ExcelWriter`) streams `CategorizedContacts` into any writable stream as an `.xlsx`, using the ExcelJS streaming writer. It never takes a filename, so nothing is written to disk. There's one sheet per category in the given order (`Saved`, `Unsaved reachable`, `Unsaved unreachable`, `Unsaved`), including empty ones. Columns are `Name | Phone`, plus `Username` (with `@`) when a Telegram-style category is present. Every cell is a plain string, contact IDs are never written, and XML-invalid characters are stripped. Deduplication, sorting, and the `POST /connections/:id/export` endpoint come in T13–T14 (`docs/specs/05-export.md`).
+
 ## Tests
 
 `npm test` runs authentication, admin authorization, user management, email capitalization, connection ownership, concurrent replacement, cleanup, fake-clock reaper, and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
