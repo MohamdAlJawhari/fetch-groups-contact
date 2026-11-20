@@ -6,3 +6,5 @@ backend/src/generated/
 !.env.example
 *.log
 Contact Export Tool - API Plan.md
+docs
+CLAUDE.MD
