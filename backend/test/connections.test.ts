@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import http from 'node:http';
+import type { Writable } from 'node:stream';
+import ExcelJS from 'exceljs';
 import { test } from 'node:test';
 import { createApp } from '../src/app.js';
 import { AuthService } from '../src/modules/auth/auth.service.js';
@@ -15,10 +18,12 @@ import { FakePlatform } from '../src/platforms/fake.platform.js';
 import { createPlatform } from '../src/platforms/platform.factory.js';
 import type { PlatformFactory, PlatformName } from '../src/platforms/platform.types.js';
 import type { User } from '../src/generated/prisma/client.js';
+import { ExcelWriter } from '../src/export/excel.writer.js';
+import { ExportService } from '../src/export/export.service.js';
 import { MemoryUserRepository } from './helpers/users.js';
 
 const password = 'Connection-test-password-123';
-async function fixture(factory?: (now: () => number) => PlatformFactory) {
+async function fixture(factory?: (now: () => number) => PlatformFactory, exporter = new ExportService()) {
   let time = 0;
   const now = () => time;
   const hasher = new BcryptPasswordHasher(4);
@@ -32,7 +37,7 @@ async function fixture(factory?: (now: () => number) => PlatformFactory) {
   const events: Array<{userId: string; action: string; platform?: string; targetUserId?: string}> = [];
   const audit = new AuditService({async insert(userId, action, platform, targetUserId) { events.push({userId, action, platform, targetUserId}); }});
   const connectionRegistry = new ConnectionRegistry(now);
-  const connections = new ConnectionsService(connectionRegistry, factory?.(now) ?? (name => createPlatform(name, {now})), audit, users, sessions);
+  const connections = new ConnectionsService(connectionRegistry, factory?.(now) ?? (name => createPlatform(name, {now})), audit, users, sessions, exporter, now);
   const auth = new AuthService(users, hasher, audit, sessions, connections);
   const userManagement = new UsersService(users, hasher, audit, sessions, connections);
   const reaper = new ConnectionReaper(connectionRegistry, connections, 600_000, now);
@@ -54,7 +59,7 @@ async function fixture(factory?: (now: () => number) => PlatformFactory) {
     assert.equal(response.status, 201);
     return await response.json() as {id: string; platform: PlatformName; status: string; qr?: string};
   };
-  return {a, b, admin, users, sessions, auth, connections, connectionRegistry, events, reaper, request, login, start,
+  return {a, b, admin, users, time: () => time, origin: `http://127.0.0.1:${address.port}`, sessions, auth, connections, connectionRegistry, events, reaper, request, login, start,
     advance(ms: number) { time += ms; },
     async close() {
       await reaper.stop();
@@ -352,4 +357,276 @@ test('platform failures never log QR values or contact details', async (t) => {
     assert.equal(JSON.stringify(logger.mock.calls.map(call => call.arguments)).includes(secret), false);
     assert.equal(JSON.stringify(f.events).includes(secret), false);
   } finally { await f.close(); }
+});
+
+// ---------- POST /connections/:id/export (docs/specs/05-export.md) ----------
+
+function gate() {
+  let open!: () => void;
+  const promise = new Promise<void>(resolve => { open = resolve; });
+  return {promise, open};
+}
+async function waitFor(check: () => boolean) {
+  for (let i = 0; i < 200 && !check(); i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.ok(check(), 'condition not reached');
+}
+const exportActions = (events: Array<{action: string}>) => events.map(event => event.action)
+  .filter(action => action.startsWith('export_') || action.startsWith('connection_'));
+async function connected(f: Awaited<ReturnType<typeof fixture>>, platform: PlatformName = 'telegram') {
+  const cookie = await f.login(f.a);
+  const connection = await f.start(cookie, platform);
+  f.advance(3_000);
+  return {cookie, id: connection.id};
+}
+const groups = {groupIds: ['sample-group-1', 'sample-group-2']};
+
+for (const [platform, sheets] of [
+  ['telegram', ['Saved', 'Unsaved reachable', 'Unsaved unreachable']],
+  ['whatsapp', ['Saved', 'Unsaved']],
+] as const) {
+  test(`${platform} export streams an xlsx, audits start/finish, then disconnects`, async () => {
+    const f = await fixture();
+    try {
+      const {cookie, id} = await connected(f, platform);
+      const platformObject = f.connectionRegistry.get(id)!.platform;
+      const response = await f.request('POST', `/connections/${id}/export`, cookie, groups);
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('content-type'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      assert.equal(response.headers.get('content-disposition'), `attachment; filename="contacts-${platform}-1970-01-01.xlsx"`);
+      assert.equal(response.headers.get('cache-control'), 'no-store');
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(await response.arrayBuffer());
+      assert.deepEqual(workbook.worksheets.map(sheet => sheet.name), sheets);
+      assert.ok(workbook.worksheets.every(sheet => sheet.rowCount === 2));
+      assert.equal((await f.request('GET', `/connections/${id}`, cookie)).status, 404);
+      assert.deepEqual(await platformObject.getStatus(), {status: 'disconnected'});
+      const audit = f.events.filter(event => event.action !== 'login');
+      assert.deepEqual(audit, ['connection_started', 'export_started', 'export_finished', 'connection_ended']
+        .map(action => ({userId: f.a.id, action, platform, targetUserId: undefined})));
+    } finally { await f.close(); }
+  });
+}
+
+test('the filename uses the UTC date the export started', async () => {
+  const f = await fixture();
+  try {
+    f.advance(Date.UTC(2026, 10, 20, 23, 59) - 3_000);
+    const {cookie, id} = await connected(f);
+    const response = await f.request('POST', `/connections/${id}/export`, cookie, groups);
+    assert.equal(response.headers.get('content-disposition'), 'attachment; filename="contacts-telegram-2026-11-20.xlsx"');
+    await response.arrayBuffer();
+  } finally { await f.close(); }
+});
+
+test('export rejects bad groupIds and unknown groups, and never audits them', async () => {
+  const f = await fixture();
+  try {
+    const {cookie, id} = await connected(f);
+    for (const body of [{}, {groupIds: []}, {groupIds: 'sample-group-1'}, {groupIds: [1]}, {groupIds: ['']},
+      {groupIds: ['x'.repeat(257)]}, {groupIds: ['sample-group-1', 'sample-group-1']},
+      {groupIds: Array.from({length: 51}, (_, i) => `g${i}`)}, {groupIds: ['sample-group-1'], ownerId: f.b.id}]) {
+      const response = await f.request('POST', `/connections/${id}/export`, cookie, body);
+      assert.equal(response.status, 400, JSON.stringify(body));
+      assert.deepEqual(await response.json(), {message: 'select between 1 and 50 groups'});
+    }
+    const unknown = await f.request('POST', `/connections/${id}/export`, cookie, {groupIds: ['sample-group-1', 'not-mine']});
+    assert.equal(unknown.status, 400);
+    assert.deepEqual(await unknown.json(), {message: 'unknown group selected'});
+    assert.equal(f.events.some(event => event.action.startsWith('export_')), false);
+    assert.equal(f.connectionRegistry.get(id)!.exporting, false);
+  } finally { await f.close(); }
+});
+
+test('export enforces auth, temporary password, ownership, and connected status', async () => {
+  const f = await fixture();
+  try {
+    const cookieA = await f.login(f.a); const cookieB = await f.login(f.b);
+    const {id} = await f.start(cookieA);
+    const notConnected = await f.request('POST', `/connections/${id}/export`, cookieA, groups);
+    assert.equal(notConnected.status, 409);
+    assert.deepEqual(await notConnected.json(), {message: 'connection is not connected yet'});
+    f.advance(3_000);
+    assert.equal((await f.request('POST', `/connections/${id}/export`, '', groups)).status, 401);
+    for (const target of [id, 'missing']) {
+      const response = await f.request('POST', `/connections/${target}/export`, cookieB, groups);
+      assert.equal(response.status, 404);
+      assert.deepEqual(await response.json(), {message: 'connection not found'});
+    }
+    f.a.mustChangePassword = true;
+    assert.equal((await f.request('POST', `/connections/${id}/export`, cookieA, groups)).status, 403);
+    assert.ok(f.connectionRegistry.get(id));
+    assert.equal(f.events.some(event => event.action.startsWith('export_')), false);
+  } finally { await f.close(); }
+});
+
+test('a platform failure before streaming returns 502, keeps the connection, logs no details, and can be retried', async (t) => {
+  const logger = t.mock.method(console, 'error', () => {});
+  const secret = 'Alice +12025550101 @alice';
+  let fail = true;
+  const f = await fixture(now => name => {
+    class Flaky extends FakePlatform {
+      override async listContacts(groupIds: readonly string[]) {
+        if (fail) throw new Error(secret);
+        return super.listContacts(groupIds);
+      }
+    }
+    return new Flaky(name, {now});
+  });
+  try {
+    const {cookie, id} = await connected(f);
+    const failed = await f.request('POST', `/connections/${id}/export`, cookie, groups);
+    assert.equal(failed.status, 502);
+    assert.deepEqual(await failed.json(), {message: 'could not read contacts from the platform; please try again'});
+    assert.deepEqual(await (await f.request('GET', `/connections/${id}`, cookie)).json(), {id, platform: 'telegram', status: 'connected'});
+    assert.equal(f.connectionRegistry.get(id)!.exporting, false);
+    assert.equal(JSON.stringify(logger.mock.calls.map(call => call.arguments)).includes(secret), false);
+    assert.equal(JSON.stringify(f.events).includes(secret), false);
+    fail = false;
+    const retried = await f.request('POST', `/connections/${id}/export`, cookie, groups);
+    assert.equal(retried.status, 200);
+    await retried.arrayBuffer();
+    assert.deepEqual(exportActions(f.events),
+      ['connection_started', 'export_started', 'export_failed', 'export_started', 'export_finished', 'connection_ended']);
+  } finally { await f.close(); }
+});
+
+test('a listGroups failure during export validation returns 502 without export audit rows', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  let fail = false;
+  const f = await fixture(now => name => {
+    class Flaky extends FakePlatform {
+      override async listGroups() { if (fail) throw new Error('down'); return super.listGroups(); }
+    }
+    return new Flaky(name, {now});
+  });
+  try {
+    const {cookie, id} = await connected(f);
+    fail = true;
+    const response = await f.request('POST', `/connections/${id}/export`, cookie, groups);
+    assert.equal(response.status, 502);
+    assert.ok(f.connectionRegistry.get(id));
+    assert.equal(f.events.some(event => event.action.startsWith('export_')), false);
+  } finally { await f.close(); }
+});
+
+function slowContacts(entered: ReturnType<typeof gate>, release: ReturnType<typeof gate>) {
+  return (now: () => number): PlatformFactory => name => {
+    class Slow extends FakePlatform {
+      override async listContacts(groupIds: readonly string[]) {
+        entered.open();
+        await release.promise;
+        return super.listContacts(groupIds);
+      }
+    }
+    return new Slow(name, {now});
+  };
+}
+
+test('while an export is fetching: a second export gets 409, status is not blocked, and the reaper skips it', async () => {
+  const entered = gate(); const release = gate();
+  const f = await fixture(slowContacts(entered, release));
+  try {
+    const {cookie, id} = await connected(f);
+    const first = f.request('POST', `/connections/${id}/export`, cookie, groups);
+    await entered.promise;
+    const second = await f.request('POST', `/connections/${id}/export`, cookie, groups);
+    assert.equal(second.status, 409);
+    assert.deepEqual(await second.json(), {message: 'an export is already running'});
+    assert.equal((await f.request('GET', `/connections/${id}`, cookie)).status, 200);
+    assert.equal((await f.request('GET', `/connections/${id}/groups`, cookie)).status, 200);
+    f.advance(700_000);
+    await f.reaper.runOnce();
+    assert.ok(f.connectionRegistry.get(id), 'reaper must not end an exporting connection');
+    release.open();
+    const response = await first;
+    assert.equal(response.status, 200);
+    await response.arrayBuffer();
+    assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_finished', 'connection_ended']);
+  } finally { release.open(); await f.close(); }
+});
+
+test('DELETE while an export is fetching ends the connection once and the export returns 404', async () => {
+  const entered = gate(); const release = gate();
+  const f = await fixture(slowContacts(entered, release));
+  try {
+    const {cookie, id} = await connected(f);
+    const exporting = f.request('POST', `/connections/${id}/export`, cookie, groups);
+    await entered.promise;
+    assert.equal((await f.request('DELETE', `/connections/${id}`, cookie)).status, 204);
+    release.open();
+    const response = await exporting;
+    assert.equal(response.status, 404);
+    assert.deepEqual(await response.json(), {message: 'connection not found'});
+    assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'connection_ended', 'export_failed']);
+  } finally { release.open(); await f.close(); }
+});
+
+function partialWriter(after: (out: Writable) => Promise<void>) {
+  const writer = new ExcelWriter();
+  writer.write = async (_contacts, out) => {
+    await new Promise<void>((resolve, reject) => out.write(Buffer.alloc(64 * 1024, 1), error => error ? reject(error) : resolve()));
+    await after(out);
+  };
+  return new ExportService(writer);
+}
+
+test('a writer failure after streaming began cuts the download off and ends the connection', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const f = await fixture(undefined, partialWriter(async () => { throw new Error('writer broke'); }));
+  try {
+    const {cookie, id} = await connected(f);
+    const response = await f.request('POST', `/connections/${id}/export`, cookie, groups);
+    assert.equal(response.status, 200);
+    await assert.rejects(response.arrayBuffer());
+    await waitFor(() => f.events.some(event => event.action === 'connection_ended'));
+    assert.equal(f.connectionRegistry.get(id), undefined);
+    assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_failed', 'connection_ended']);
+  } finally { await f.close(); }
+});
+
+test('DELETE while the file is streaming cuts the download off and ends the connection once', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const streaming = gate();
+  const f = await fixture(undefined, partialWriter(async out => {
+    streaming.open();
+    if (!out.destroyed) await once(out, 'close');
+    throw new Error('closed');
+  }));
+  try {
+    const {cookie, id} = await connected(f);
+    const response = await f.request('POST', `/connections/${id}/export`, cookie, groups);
+    assert.equal(response.status, 200);
+    await streaming.promise;
+    assert.equal((await f.request('DELETE', `/connections/${id}`, cookie)).status, 204);
+    await assert.rejects(response.arrayBuffer());
+    await waitFor(() => f.events.some(event => event.action === 'export_failed'));
+    assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'connection_ended', 'export_failed']);
+  } finally { streaming.open(); await f.close(); }
+});
+
+test('the client aborting mid-download is audited as export_failed and ends the connection', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const streaming = gate();
+  const f = await fixture(undefined, partialWriter(async out => {
+    streaming.open();
+    if (!out.destroyed) await once(out, 'close');
+    throw new Error('client went away');
+  }));
+  try {
+    const {cookie, id} = await connected(f);
+    // node:http lets the test drop the socket the way a closing browser tab does.
+    const body = JSON.stringify(groups);
+    const request = http.request(`${f.origin}/connections/${id}/export`, {
+      method: 'POST', agent: false, headers: {'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), Cookie: cookie},
+    });
+    request.on('error', () => {});
+    request.end(body);
+    const [response] = await once(request, 'response') as [http.IncomingMessage];
+    assert.equal(response.statusCode, 200);
+    await streaming.promise;
+    request.destroy();
+    await waitFor(() => f.events.some(event => event.action === 'connection_ended'));
+    assert.equal(f.connectionRegistry.get(id), undefined);
+    assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_failed', 'connection_ended']);
+  } finally { streaming.open(); await f.close(); }
 });

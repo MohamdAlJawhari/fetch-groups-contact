@@ -1,6 +1,6 @@
 # Contact Export backend
 
-Requires Node.js 22.12+ and PostgreSQL. Authentication, admin user management, and the fake connection lifecycle are implemented. Telegram and WhatsApp both use `FakePlatform`; real platform integrations and export come later.
+Requires Node.js 22.12+ and PostgreSQL. Authentication, admin user management, and the fake connection lifecycle are implemented. Telegram and WhatsApp both use `FakePlatform`; export (`POST /connections/:id/export`) works against the fake platform; real platform integrations come later.
 
 From this folder, install dependencies with `npm ci`. Copy `.env.example` to `.env` if `.env` does not exist, then edit it:
 
@@ -84,16 +84,17 @@ $created = Invoke-RestMethod -Uri 'http://localhost:3000/admin/users' `
 
 ## Fake connections
 
-All four routes require an active logged-in user who has changed their temporary password:
+All five routes require an active logged-in user who has changed their temporary password:
 
 | Method | Path | Body | Response |
 | --- | --- | --- | --- |
 | POST | `/connections` | `{"platform":"telegram"}` or `{"platform":"whatsapp"}` | 201 with `id`, `platform`, `status`, and placeholder `qr`. |
 | GET | `/connections/:id` | None | 200 with status; `qr` appears only while waiting for scan. |
 | GET | `/connections/:id/groups` | None | 200 with `{"groups":[{"id":"sample-group-1","title":"Sample team"},...]}` once connected; 409 while waiting. |
+| POST | `/connections/:id/export` | `{"groupIds":["sample-group-1"]}` | 200 streaming `.xlsx`; then disconnects. See Export below. |
 | DELETE | `/connections/:id` | None | 204; disconnects the platform and removes the registry entry. |
 
-The fake QR is a placeholder string, not a scannable login code. The fake platform reports `waiting-for-scan` initially and `connected` after three seconds, using an injectable clock rather than a background scan timer. The platform interface exposes `connect`, `getStatus`, `listGroups`, `listContacts`, and `disconnect`. Fake Telegram contacts have `saved`, `unsaved_reachable`, and `unsaved_unreachable` categories. Fake WhatsApp contacts have `saved` and `unsaved` categories. Contacts remain internal to the platform interface; there is no contacts or export endpoint yet.
+The fake QR is a placeholder string, not a scannable login code. The fake platform reports `waiting-for-scan` initially and `connected` after three seconds, using an injectable clock rather than a background scan timer. The platform interface exposes `connect`, `getStatus`, `listGroups`, `listContacts`, and `disconnect`. Fake Telegram contacts have `saved`, `unsaved_reachable`, and `unsaved_unreachable` categories. Fake WhatsApp contacts have `saved` and `unsaved` categories. Contacts leave the backend only inside the exported `.xlsx`.
 
 The in-memory registry stores the owner, platform name, platform object, and last activity under an ID made from 32 cryptographically random bytes. Missing IDs and IDs owned by another user both return 404 with `{"message":"connection not found"}`. Only authorized accesses refresh activity. Starting a new connection disconnects and replaces the user's old connection, even across platform names. Operations are serialized per user to avoid concurrent replacements leaving multiple live platforms.
 
@@ -114,13 +115,37 @@ Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)/grou
 Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)" -Method Delete -WebSession $appSession
 ```
 
-## Export (in progress, step 5)
+## Export (step 5)
 
-`src/export/excel.writer.ts` (`ExcelWriter`) streams `CategorizedContacts` into any writable stream as an `.xlsx`, using the ExcelJS streaming writer. It never takes a filename, so nothing is written to disk. There's one sheet per category in the given order (`Saved`, `Unsaved reachable`, `Unsaved unreachable`, `Unsaved`), including empty ones. Columns are `Name | Phone`, plus `Username` (with `@`) when a Telegram-style category is present. Every cell is a plain string, contact IDs are never written, and XML-invalid characters are stripped. Deduplication, sorting, and the `POST /connections/:id/export` endpoint come in T13–T14 (`docs/specs/05-export.md`).
+`POST /connections/:id/export` with `{"groupIds":[...]}` (1–50 unique IDs from `/groups`) streams `contacts-<platform>-<UTC date>.xlsx`, then disconnects the connection. The full rules are in `docs/specs/05-export.md`.
+
+| Status | Message | When |
+| --- | --- | --- |
+| 400 | `select between 1 and 50 groups` | Bad or duplicate `groupIds`, or extra fields |
+| 400 | `unknown group selected` | An ID isn't one of the connection's groups |
+| 404 | `connection not found` | Missing or not yours, or ended (for example by `DELETE`) while contacts were being fetched |
+| 409 | `connection is not connected yet` / `an export is already running` | |
+| 502 | `could not read contacts from the platform; please try again` | Fetching failed before streaming. The connection is kept, so retry without a new scan. |
+| — | download cut off | A failure, a `DELETE`/logout/disable, or the client leaving after streaming began. The connection is ended. |
+
+- **How it runs:** `ConnectionsService.export` validates under the per-user lock, then fetches and streams **outside** it, so status polls and `DELETE` keep responding during a long export. While the connection's `exporting` flag is set, a second export gets 409 and the reaper skips the connection. Ending the connection by any route calls its `abortExport` callback, which destroys the response.
+- **Audit:** `export_started`, then `export_finished` or `export_failed` (user and platform only), then `connection_ended` once.
+- **Logs:** stream failures log only the error class name.
+- **`ExcelWriter`** (`src/export/excel.writer.ts`) uses the ExcelJS streaming writer and never takes a filename, so nothing touches the disk. There's one sheet per category in order (`Saved`, `Unsaved reachable`, `Unsaved unreachable`, `Unsaved`), including empty ones. The columns are `Name | Phone`, plus `Username` (with `@`) for Telegram-style categories. Every cell is plain text (no formulas), contact IDs are never written, and XML-invalid characters are stripped.
+- **`ExportService`** (`src/export/export.service.ts`): `prepare` makes one `listContacts` call, deduplicates by contact `id` (first wins), and sorts by name (ignoring case and accents, empty names last), then by phone and username. `write` delegates to the writer.
+
+After logging in and connecting as above (wait until the status is `connected`):
+
+```powershell
+Invoke-WebRequest -Uri "http://localhost:3000/connections/$($connection.id)/export" `
+    -Method Post -ContentType 'application/json' `
+    -Body '{"groupIds":["sample-group-1","sample-group-2"]}' `
+    -WebSession $appSession -OutFile "$HOME\Downloads\contacts-telegram.xlsx"
+```
 
 ## Tests
 
-`npm test` runs authentication, admin authorization, user management, email capitalization, connection ownership, concurrent replacement, cleanup, fake-clock reaper, and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
+`npm test` runs authentication, admin authorization, user management, email capitalization, connection ownership, concurrent replacement, cleanup, fake-clock reaper, Excel writer, export service, export endpoint (errors, audit, concurrency, aborted downloads), and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
 
 ```powershell
 $env:RUN_DATABASE_TESTS = '1'

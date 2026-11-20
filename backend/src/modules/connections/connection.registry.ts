@@ -7,6 +7,10 @@ export interface ConnectionEntry {
   readonly platformName: PlatformName;
   readonly platform: Platform;
   lastActivity: number;
+  /** True while an export runs; the reaper skips the connection and a second export gets 409. */
+  exporting: boolean;
+  /** Set while an export streams; ending the connection calls it to cut the download off. */
+  abortExport?: () => void;
 }
 
 export class ConnectionRegistry {
@@ -16,7 +20,7 @@ export class ConnectionRegistry {
   add(ownerId: string, platformName: PlatformName, platform: Platform) {
     if (this.owners.has(ownerId)) throw new Error('User already has a connection');
     const id = randomBytes(32).toString('hex');
-    const entry: ConnectionEntry = { id, ownerId, platformName, platform, lastActivity: this.now() };
+    const entry: ConnectionEntry = { id, ownerId, platformName, platform, lastActivity: this.now(), exporting: false };
     this.connections.set(id, entry);
     this.owners.set(ownerId, id);
     return entry;
