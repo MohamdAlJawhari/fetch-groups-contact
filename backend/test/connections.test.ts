@@ -82,8 +82,8 @@ test('fake platforms provide placeholder QR, scan transition, groups, and contac
     assert.deepEqual(await platform.getStatus(), {status: 'connected'});
     assert.equal((await platform.listGroups()).length, 2);
     const categories = await platform.listContacts(['sample-group-1']);
-    assert.deepEqual(categories.map(item => item.category), name === 'telegram'
-      ? ['saved', 'unsaved_reachable', 'unsaved_unreachable'] : ['saved', 'unsaved']);
+    // Both platforms give 3 categories (docs/specs/08-whatsapp.md).
+    assert.deepEqual(categories.map(item => item.category), ['saved', 'unsaved_reachable', 'unsaved_unreachable']);
     assert.ok(categories.every(item => item.contacts.length > 0));
     await platform.disconnect();
     assert.deepEqual(await platform.getStatus(), {status: 'disconnected'});
@@ -387,7 +387,7 @@ const groups = {groupIds: ['sample-group-1', 'sample-group-2']};
 
 for (const [platform, sheets] of [
   ['telegram', ['Saved', 'Unsaved reachable', 'Unsaved unreachable']],
-  ['whatsapp', ['Saved', 'Unsaved']],
+  ['whatsapp', ['Saved', 'Unsaved reachable', 'Unsaved unreachable']],
 ] as const) {
   test(`${platform} export streams an xlsx, audits start/finish, then disconnects`, async () => {
     const f = await fixture();

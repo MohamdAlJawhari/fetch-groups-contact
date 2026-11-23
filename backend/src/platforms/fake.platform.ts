@@ -44,9 +44,11 @@ export class FakePlatform implements Platform {
       throw new Error('Select valid sample groups');
     }
     const saved = { category: 'saved' as const, contacts: [{ id: 'sample-saved', name: 'Sample saved contact', phoneNumber: '+12025550101' }] };
-    if (this.name === 'whatsapp') return [saved, {
-      category: 'unsaved', contacts: [{ id: 'sample-unsaved', name: 'Sample unsaved contact', phoneNumber: '+12025550102' }],
-    }];
+    // Both platforms export 3 categories (docs/specs/08-whatsapp.md: hidden WhatsApp numbers make "unreachable" real).
+    if (this.name === 'whatsapp') return [saved,
+      { category: 'unsaved_reachable', contacts: [{ id: 'sample-unsaved', name: 'Sample unsaved contact', phoneNumber: '+12025550102' }] },
+      { category: 'unsaved_unreachable', contacts: [{ id: 'sample-hidden', name: 'Sample hidden-number contact' }] },
+    ];
     return [saved,
       { category: 'unsaved_reachable', contacts: [{ id: 'sample-reachable', name: 'Sample reachable contact', username: 'sample_contact' }] },
       { category: 'unsaved_unreachable', contacts: [{ id: 'sample-unreachable', name: 'Sample unreachable contact' }] },

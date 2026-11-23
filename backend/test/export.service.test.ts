@@ -72,10 +72,10 @@ test('does not modify the platform result', async () => {
   assert.deepEqual(input, before);
 });
 
-test('telegram fake gives 3 categories and whatsapp fake gives 2, in order', async () => {
+test('both fakes give the 3 categories in order (WhatsApp too, since spec 08)', async () => {
   for (const [name, expected] of [
     ['telegram', ['saved', 'unsaved_reachable', 'unsaved_unreachable']],
-    ['whatsapp', ['saved', 'unsaved']],
+    ['whatsapp', ['saved', 'unsaved_reachable', 'unsaved_unreachable']],
   ] as const) {
     const platform = new FakePlatform(name, { scanDelayMs: 0 });
     await platform.connect();

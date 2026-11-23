@@ -1,6 +1,6 @@
 # Contact Export backend
 
-Requires Node.js 22.12+ and PostgreSQL. Authentication, admin user management, and the fake connection lifecycle are implemented. Telegram uses the real `TelegramPlatform` (GramJS) when `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` are set: QR login, two-step verification, logout (T16), the group list (T17), and member export (T18) work. Without the keys, and for WhatsApp, `FakePlatform` is used. Export (`POST /connections/:id/export`) works against the fake platform.
+Requires Node.js 22.12+ and PostgreSQL. Authentication, admin user management, and the fake connection lifecycle are implemented. Telegram uses the real `TelegramPlatform` (GramJS) when `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` are set: QR login, two-step verification, logout (T16), the group list (T17), and member export (T18) work. WhatsApp uses the real `WhatsAppPlatform` (Baileys) by default (T20–T22). `FakePlatform` is used for Telegram without keys, and for WhatsApp with `WHATSAPP_PLATFORM=fake`. Export (`POST /connections/:id/export`) works against the fake platform.
 
 From this folder, install dependencies with `npm ci`. Copy `.env.example` to `.env` if `.env` does not exist, then edit it:
 
@@ -21,7 +21,7 @@ npm start
 
 For development, use `npm run dev`. After changing the schema, use `npm run db:migrate -- --name descriptive_name`, followed by `npm run db:generate`. Prisma CLI connection settings live in `prisma.config.ts`.
 
-Configuration is validated once in `src/config/env.ts`: `DATABASE_URL` and a 32-character `COOKIE_SECRET` are required; `PORT` defaults to 3000, `NODE_ENV` to development, and `CONNECTION_IDLE_TIMEOUT_MS` to 600000. `ADMIN_EMAIL` is optional and reserved for future configuration; authorization uses the user's database role. `TELEGRAM_API_ID` (a positive integer) and `TELEGRAM_API_HASH` (32 hex characters) come from my.telegram.org. Set both or neither (empty counts as unset). Without them, `telegram` uses the fake platform and startup logs `telegram: using the fake platform`; with `NODE_ENV=production`, startup fails without them. The schema lives in `src/config/env.schema.ts` (`parseEnvironment`), and error messages name variables, never values.
+Configuration is validated once in `src/config/env.ts`: `DATABASE_URL` and a 32-character `COOKIE_SECRET` are required; `PORT` defaults to 3000, `NODE_ENV` to development, and `CONNECTION_IDLE_TIMEOUT_MS` to 600000. `ADMIN_EMAIL` is optional and reserved for future configuration; authorization uses the user's database role. `TELEGRAM_API_ID` (a positive integer) and `TELEGRAM_API_HASH` (32 hex characters) come from my.telegram.org. Set both or neither (empty counts as unset). Without them, `telegram` uses the fake platform and startup logs `telegram: using the fake platform`; with `NODE_ENV=production`, startup fails without them. `WHATSAPP_PLATFORM` is `baileys` (the default, real WhatsApp) or `fake` (no phone needed, refused in production), and `fake` logs `whatsapp: using the fake platform`. The schema lives in `src/config/env.schema.ts` (`parseEnvironment`), and error messages name variables, never values.
 
 `User` maps to `users`, and `AuditLog` to `audit_log`, with snake_case columns as specified in the plan. User IDs are database-generated UUIDs; audit IDs are bigserial. The migration also enforces the plan's allowed role and platform values with PostgreSQL check constraints. No contact data or platform sessions are stored.
 
@@ -189,9 +189,29 @@ Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)/pass
 
 In the Telegram app: Settings → Devices → Link Desktop Device, then scan. Then `Invoke-RestMethod "http://localhost:3000/connections/$($connection.id)/groups" -WebSession $appSession` lists the groups. Then export as in "Export (step 5)" with the real group IDs.
 
+## WhatsApp (step 8)
+
+The rules are in `docs/specs/08-whatsapp.md`. `WhatsAppPlatform` (`src/platforms/whatsapp/whatsapp.platform.ts`) holds all Baileys code (`baileys@7.0.0-rc14`, pinned):
+
+- **Auth state:** in memory only (`initAuthCreds()` plus a `Map` key store). There's no `useMultiFileAuthState` and nothing on disk, and it's dropped on disconnect. Baileys' logger is a silent object.
+- **Linking:** `POST /connections {"platform":"whatsapp"}` resolves on the first QR (502 if none within 15 s). The QR changes about every 20 s. After the scan, WhatsApp closes once with 515 (restart required), and the platform reopens with the same in-memory auth. Then the status turns `connected`. Any other close (logged out, timed out, replaced) gives `disconnected`.
+- **Quiet socket:** not shown online (`markOnlineOnConnect: false`), and no chat history is downloaded (only `PUSH_NAME` history chunks, which carry display names). Nothing is ever sent.
+- **Saved contacts:** after linking, it waits for the phone's app-state key and resyncs only the contacts collection (`critical_unblock_low`), which holds the address-book names. An export waits up to 60 s for this. Otherwise it returns 502 and keeps the connection, and the next export retries.
+- **Groups:** one `groupFetchAllParticipating()` request, with community parent entries dropped, sorted by title. It's cached for 60 s, so the export right after it needs no second request.
+- **Members and categories** (`whatsapp.categorizer.ts`): phone from the phone JID, or Baileys' `phoneNumber`, or its local LID→phone mapping, or the saved contact. `saved` = has an address-book name. `unsaved_reachable` = a visible phone or a WhatsApp username. `unsaved_unreachable` = WhatsApp hid the number. The name is the saved name, otherwise the push name. The linked account itself is excluded. Duplicate IDs are `pn:<digits>` or `lid:<lid>`.
+- **Disconnect:** when linked, `sock.logout()` (5 s) unlinks the device, then the socket is ended. It never throws.
+
+Manual check (both platforms):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File <scratchpad>\platform-check.ps1 -Platform whatsapp
+```
+
+In WhatsApp: Settings → Linked devices → Link a device, then scan. The QR is large, so maximize the window.
+
 ## Tests
 
-`npm test` runs authentication, admin authorization, user management, email capitalization, connection ownership, concurrent replacement, cleanup, fake-clock reaper, Excel writer, export service, export endpoint (errors, audit, concurrency, aborted downloads), environment validation (Telegram keys), the Telegram login state machine with a scripted fake GramJS client (QR, 2FA, logout), the password endpoint, the Telegram group filter, dialog paging and member mapping against real GramJS objects, the throttle (fake clock), the Telegram categorizer, hidden-member detection, and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
+`npm test` runs authentication, admin authorization, user management, email capitalization, connection ownership, concurrent replacement, cleanup, fake-clock reaper, Excel writer, export service, export endpoint (errors, audit, concurrency, aborted downloads), environment validation (Telegram keys), the Telegram login state machine with a scripted fake GramJS client (QR, 2FA, logout), the password endpoint, the Telegram group filter, dialog paging and member mapping against real GramJS objects, the throttle (fake clock), the Telegram categorizer, hidden-member detection, the WhatsApp categorizer, link/restart/logout state machine and member resolution (scripted socket), and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
 
 ```powershell
 $env:RUN_DATABASE_TESTS = '1'

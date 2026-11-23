@@ -20,7 +20,11 @@ const environmentSchema = z.object({
   ADMIN_EMAIL: z.string().email().optional(),
   TELEGRAM_API_ID: optional(z.coerce.number().int().positive()),
   TELEGRAM_API_HASH: optional(z.string().regex(/^[0-9a-f]{32}$/i, 'Must be the 32-character hex api_hash from my.telegram.org')),
+  WHATSAPP_PLATFORM: z.preprocess(value => value === '' ? undefined : value, z.enum(['baileys', 'fake']).default('baileys')),
 }).superRefine((value, context) => {
+  if (value.WHATSAPP_PLATFORM === 'fake' && value.NODE_ENV === 'production') {
+    context.addIssue({ code: 'custom', path: ['WHATSAPP_PLATFORM'], message: 'Must be baileys in production' });
+  }
   const hasId = value.TELEGRAM_API_ID !== undefined;
   const hasHash = value.TELEGRAM_API_HASH !== undefined;
   if (hasId !== hasHash) {
@@ -52,5 +56,6 @@ export function parseEnvironment(environment: NodeJS.ProcessEnv) {
     connectionIdleTimeoutMs: data.CONNECTION_IDLE_TIMEOUT_MS,
     adminEmail: data.ADMIN_EMAIL,
     telegram,
+    whatsappPlatform: data.WHATSAPP_PLATFORM,
   });
 }

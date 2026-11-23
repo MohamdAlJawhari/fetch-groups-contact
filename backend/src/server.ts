@@ -22,7 +22,9 @@ async function main() {
   const audit = new AuditService(new PrismaAuditRepository(prisma));
   const connectionRegistry = new ConnectionRegistry();
   if (!config.telegram) console.log('telegram: using the fake platform');
-  const connections = new ConnectionsService(connectionRegistry, name => createPlatform(name, { telegram: config.telegram }), audit, users, sessions);
+  if (config.whatsappPlatform === 'fake') console.log('whatsapp: using the fake platform');
+  const connections = new ConnectionsService(connectionRegistry,
+    name => createPlatform(name, { telegram: config.telegram, whatsapp: config.whatsappPlatform }), audit, users, sessions);
   const reaper = new ConnectionReaper(connectionRegistry, connections, config.connectionIdleTimeoutMs);
   const auth = new AuthService(users, hasher, audit, sessions, connections);
   const userManagement = new UsersService(users, hasher, audit, sessions, connections);
