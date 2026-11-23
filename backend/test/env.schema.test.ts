@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { parseEnvironment } from '../src/config/env.schema.js';
+import { parseEnvironment, parseTrustProxy } from '../src/config/env.schema.js';
 
 const base = { DATABASE_URL: 'postgresql://user:pass@localhost:5432/app', COOKIE_SECRET: 'c'.repeat(32) };
 const hash = '0123456789abcdef0123456789abcdef';
@@ -30,4 +30,17 @@ test('malformed Telegram keys are rejected', () => {
   assert.throws(() => parseEnvironment({ ...base, TELEGRAM_API_ID: 'abc', TELEGRAM_API_HASH: hash }), /TELEGRAM_API_ID/);
   assert.throws(() => parseEnvironment({ ...base, TELEGRAM_API_ID: '0', TELEGRAM_API_HASH: hash }), /TELEGRAM_API_ID/);
   assert.throws(() => parseEnvironment({ ...base, TELEGRAM_API_ID: '1', TELEGRAM_API_HASH: 'xyz' }), /TELEGRAM_API_HASH: Must be/);
+});
+
+test('TRUST_PROXY is off by default and accepts loopback, a hop count, or proxy IPs, but never true', () => {
+  assert.equal(parseEnvironment(base).trustProxy, false);
+  assert.equal(parseEnvironment({ ...base, TRUST_PROXY: '' }).trustProxy, false);
+  assert.equal(parseEnvironment({ ...base, TRUST_PROXY: 'false' }).trustProxy, false);
+  assert.equal(parseEnvironment({ ...base, TRUST_PROXY: '0' }).trustProxy, false);
+  assert.equal(parseEnvironment({ ...base, TRUST_PROXY: 'loopback' }).trustProxy, 'loopback');
+  assert.equal(parseEnvironment({ ...base, TRUST_PROXY: '1' }).trustProxy, 1);
+  assert.equal(parseEnvironment({ ...base, TRUST_PROXY: ' 10.0.0.1, 10.0.0.2 ' }).trustProxy, '10.0.0.1, 10.0.0.2');
+  assert.throws(() => parseEnvironment({ ...base, TRUST_PROXY: 'true' }), /TRUST_PROXY: Use loopback/);
+  assert.throws(() => parseEnvironment({ ...base, TRUST_PROXY: 'TRUE' }), /TRUST_PROXY/);
+  assert.equal(parseTrustProxy(undefined), false);
 });

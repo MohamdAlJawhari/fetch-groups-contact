@@ -17,6 +17,7 @@ import { ConnectionReaper } from '../src/modules/connections/connection.reaper.j
 import { FakePlatform } from '../src/platforms/fake.platform.js';
 import { createPlatform } from '../src/platforms/platform.factory.js';
 import { PlatformError } from '../src/platforms/platform.errors.js';
+import { createConnectionRateLimiter } from '../src/middleware/connectionRateLimiter.js';
 import type { PlatformFactory, PlatformName } from '../src/platforms/platform.types.js';
 import type { User } from '../src/generated/prisma/client.js';
 import { ExcelWriter } from '../src/export/excel.writer.js';
@@ -43,7 +44,7 @@ async function fixture(factory?: (now: () => number) => PlatformFactory, exporte
   const userManagement = new UsersService(users, hasher, audit, sessions, connections);
   const reaper = new ConnectionReaper(connectionRegistry, connections, 600_000, now);
   const server = createApp({users, sessions, auth, userManagement, connections, connectionRegistry,
-    cookieSecret: 's'.repeat(48), production: false}).listen(0, '127.0.0.1');
+    cookieSecret: 's'.repeat(48), production: false, connectionLimiter: createConnectionRateLimiter({now})}).listen(0, '127.0.0.1');
   await once(server, 'listening');
   const address = server.address();
   assert.ok(address && typeof address !== 'string');
@@ -781,5 +782,44 @@ test('POST /connections returns 502 when the platform cannot produce a QR code, 
     assert.deepEqual(disconnected, ['telegram']);
     assert.deepEqual(f.connectionRegistry.entries(), []);
     assert.equal(f.events.some(event => event.action.startsWith('connection_')), false);
+  } finally { await f.close(); }
+});
+
+// ---------- T23: connection rate limit ----------
+
+test('more than 5 connection starts per user per minute get 429 with Retry-After, and the limit resets', async () => {
+  const f = await fixture();
+  try {
+    const a = await f.login(f.a);
+    for (let attempt = 1; attempt <= 5; attempt++) await f.start(a, attempt % 2 ? 'telegram' : 'whatsapp');
+    f.advance(30_000);
+    const blocked = await f.request('POST', '/connections', a, {platform: 'telegram'});
+    assert.equal(blocked.status, 429);
+    assert.equal(blocked.headers.get('retry-after'), '30');
+    assert.equal(blocked.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(await blocked.json(), {message: 'too many connection attempts; try again shortly'});
+    // Invalid bodies count too (every attempt may open a socket), but they don't extend the window.
+    assert.equal((await f.request('POST', '/connections', a, {platform: 'nope'})).status, 429);
+    // Other users and the user's other routes aren't affected.
+    const b = await f.login(f.b);
+    await f.start(b);
+    const live = f.connectionRegistry.getByOwner(f.a.id)!;
+    assert.equal((await f.request('GET', `/connections/${live.id}`, a)).status, 200);
+    f.advance(30_000);
+    await f.start(a);
+    assert.equal(f.events.filter(event => event.userId === f.a.id && event.action === 'connection_started').length, 6);
+  } finally { await f.close(); }
+});
+
+test('the connection limit counts failed attempts and runs after authentication', async () => {
+  const f = await fixture();
+  try {
+    assert.equal((await f.request('POST', '/connections', '', {platform: 'telegram'})).status, 401);
+    const a = await f.login(f.a);
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      assert.equal((await f.request('POST', '/connections', a, {platform: 'nope'})).status, 400);
+    }
+    assert.equal((await f.request('POST', '/connections', a, {platform: 'telegram'})).status, 429);
+    assert.equal(f.connectionRegistry.getByOwner(f.a.id), undefined);
   } finally { await f.close(); }
 });

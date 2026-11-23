@@ -16,6 +16,7 @@ import { ConnectionsController } from './modules/connections/connections.control
 import type { ConnectionsService } from './modules/connections/connections.service.js';
 import type { ConnectionRegistry } from './modules/connections/connection.registry.js';
 import { requireOwnedConnection } from './middleware/requireOwnedConnection.js';
+import { createConnectionRateLimiter } from './middleware/connectionRateLimiter.js';
 
 export interface AppDependencies {
   auth: AuthService;
@@ -27,11 +28,16 @@ export interface AppDependencies {
   cookieSecret: string;
   production: boolean;
   loginLimiter?: express.RequestHandler;
+  /** T23: per-user limit on POST /connections (default 5 per minute). */
+  connectionLimiter?: express.RequestHandler;
+  /** T24: Express `trust proxy` (default off), so the rate limiters see the real client IP behind Caddy. */
+  trustProxy?: false | number | string;
 }
 
 export function createApp(dependencies: AppDependencies) {
   const app = express();
   app.disable('x-powered-by');
+  app.set('trust proxy', dependencies.trustProxy ?? false);
   // Parse JSON before mounting auth routes so the limiter can read the email.
   app.use(express.json({ limit: '16kb' }));
   app.use(cookieParser(dependencies.cookieSecret));
@@ -52,6 +58,7 @@ export function createApp(dependencies: AppDependencies) {
     new ConnectionsController(dependencies.connections),
     requireAuth(dependencies.sessions, dependencies.users),
     requireOwnedConnection(dependencies.connectionRegistry),
+    dependencies.connectionLimiter ?? createConnectionRateLimiter(),
   ));
   app.use(errorHandler);
   return app;

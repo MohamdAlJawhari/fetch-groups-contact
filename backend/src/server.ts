@@ -31,6 +31,7 @@ async function main() {
   const cleanup = setInterval(() => sessions.prune(), 60_000);
   cleanup.unref();
   const server = createApp({ auth, sessions, users, userManagement, connections, connectionRegistry, cookieSecret: config.cookieSecret,
+    trustProxy: config.trustProxy,
     production: config.nodeEnv === 'production' }).listen(config.port, () => {
     console.log(`Backend listening on port ${config.port}`);
   });

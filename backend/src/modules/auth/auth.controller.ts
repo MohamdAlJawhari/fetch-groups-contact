@@ -18,6 +18,10 @@ export class AuthController {
     response.cookie(SESSION_COOKIE, result.sessionId, { ...this.cookieOptions, maxAge: SESSION_TTL_MS });
     response.json({ user: result.user });
   };
+  /** The same public user shape as login. Reads memory and the user row only; no audit event. */
+  me = (request: Request, response: Response) => {
+    response.json({ user: request.user });
+  };
   logout = async (request: Request, response: Response) => {
     response.clearCookie(SESSION_COOKIE, this.cookieOptions);
     await this.auth.logout(request.sessionId!, request.user!.id);

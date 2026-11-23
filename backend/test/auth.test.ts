@@ -17,7 +17,7 @@ import { createConnectionServices } from './helpers/connections.js';
 const password = 'initial-password-123';
 const changedPassword = 'replacement-password-456';
 
-async function fixture(options: { production?: boolean; ipLimit?: number; emailIpLimit?: number; emailLimit?: number } = {}) {
+async function fixture(options: { production?: boolean; ipLimit?: number; emailIpLimit?: number; emailLimit?: number; trustProxy?: false | number | string } = {}) {
   let time = Date.now();
   const hasher = new BcryptPasswordHasher(4);
   const user: User = { id: 'test-user', email: 'user@example.com', passwordHash: await hasher.hash(password),
@@ -30,6 +30,7 @@ async function fixture(options: { production?: boolean; ipLimit?: number; emailI
   const auth = new AuthService(users, hasher, auditService, sessions, lifecycle.connections);
   const userManagement = new UsersService(users, hasher, auditService, sessions, lifecycle.connections);
   const app = createApp({ users, auth, sessions, userManagement, ...lifecycle, production: options.production ?? false, cookieSecret: 's'.repeat(48),
+    trustProxy: options.trustProxy,
     loginLimiter: createLoginRateLimiter({ ipLimit: options.ipLimit ?? 100, emailIpLimit: options.emailIpLimit ?? 100, emailLimit: options.emailLimit ?? 100, now: () => time }) });
   app.get('/protected', requireAuth(sessions, users), (_request, response) => response.json({ok: true}));
   app.use(errorHandler);
@@ -326,5 +327,83 @@ test('internal login errors are logged without credentials and do not consume th
     assert.doesNotMatch(logs, /initial-password-123|Database failed|password|cookie|session/i);
     f.users.findByEmail = original;
     assert.equal((await f.login()).status, 200);
+  } finally { await f.close(); }
+});
+
+// ---------- T24: trust proxy ----------
+
+async function failFromForwardedIps(trustProxy: false | number | string | undefined) {
+  const f = await fixture({ipLimit: 2, trustProxy});
+  try {
+    const statuses: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const response = await fetch(f.base + '/auth/login', {method: 'POST', headers: {
+        'Content-Type': 'application/json', 'X-Forwarded-For': `192.0.2.${i}`,
+      }, body: JSON.stringify({email: `user${i}@example.com`, password})});
+      statuses.push(response.status);
+    }
+    return statuses;
+  } finally { await f.close(); }
+}
+
+test('trust proxy off (the default): X-Forwarded-For is ignored, so the limiter sees one IP', async () => {
+  assert.deepEqual(await failFromForwardedIps(undefined), [401, 401, 429]);
+  assert.deepEqual(await failFromForwardedIps(false), [401, 401, 429]);
+});
+
+test('trust proxy on (loopback or 1 hop, as behind Caddy): each forwarded client IP has its own allowance', async () => {
+  assert.deepEqual(await failFromForwardedIps('loopback'), [401, 401, 401]);
+  assert.deepEqual(await failFromForwardedIps(1), [401, 401, 401]);
+});
+
+test('trust proxy for another proxy address ignores headers sent from loopback', async () => {
+  assert.deepEqual(await failFromForwardedIps('203.0.113.7'), [401, 401, 429]);
+});
+
+// ---------- T25: GET /auth/me ----------
+
+test('GET /auth/me returns the login user shape for a session, with no-store and no audit event', async () => {
+  const f = await fixture();
+  try {
+    const login = await f.login();
+    const loginUser = (await login.json() as {user: unknown}).user;
+    const auditBefore = f.audit.length;
+    const response = await fetch(f.base + '/auth/me', {headers: {Cookie: cookie(login)}});
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    const body = await response.json() as {user: Record<string, unknown>};
+    assert.deepEqual(body, {user: {id: 'test-user', email: 'user@example.com', role: 'user', mustChangePassword: false}});
+    assert.deepEqual(body.user, loginUser);
+    assert.doesNotMatch(JSON.stringify(body), /passwordHash|\$2[aby]\$/);
+    assert.equal(f.audit.length, auditBefore);
+  } finally { await f.close(); }
+});
+
+test('GET /auth/me is 401 without a session, with a tampered cookie, after logout, and for a disabled user', async () => {
+  const f = await fixture();
+  try {
+    for (const headers of [{}, {Cookie: 'session=s%3Aforged.signature'}]) {
+      const response = await fetch(f.base + '/auth/me', {headers});
+      assert.equal(response.status, 401);
+      assert.deepEqual(await response.json(), {message: 'authentication required'});
+    }
+    const loggedOut = cookie(await f.login());
+    await f.post('/auth/logout', {}, loggedOut);
+    assert.equal((await fetch(f.base + '/auth/me', {headers: {Cookie: loggedOut}})).status, 401);
+    const disabled = cookie(await f.login());
+    await f.users.setActive(f.user.id, false);
+    assert.equal((await fetch(f.base + '/auth/me', {headers: {Cookie: disabled}})).status, 401);
+  } finally { await f.close(); }
+});
+
+test('GET /auth/me allows a temporary password and reports mustChangePassword: true', async () => {
+  const f = await fixture();
+  try {
+    f.user.mustChangePassword = true;
+    const session = cookie(await f.login());
+    const response = await fetch(f.base + '/auth/me', {headers: {Cookie: session}});
+    assert.equal(response.status, 200);
+    assert.equal((await response.json() as {user: {mustChangePassword: boolean}}).user.mustChangePassword, true);
+    assert.equal((await fetch(f.base + '/protected', {headers: {Cookie: session}})).status, 403);
   } finally { await f.close(); }
 });

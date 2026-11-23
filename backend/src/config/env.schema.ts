@@ -20,6 +20,11 @@ const environmentSchema = z.object({
   ADMIN_EMAIL: z.string().email().optional(),
   TELEGRAM_API_ID: optional(z.coerce.number().int().positive()),
   TELEGRAM_API_HASH: optional(z.string().regex(/^[0-9a-f]{32}$/i, 'Must be the 32-character hex api_hash from my.telegram.org')),
+  // T24: off by default. Behind Caddy on the same machine use `loopback`; a hop count or an IP/subnet list also works.
+  // `true` (trust every proxy) is refused: anyone reaching the backend directly could then spoof their IP.
+  TRUST_PROXY: z.preprocess(value => value === '' ? undefined : value, z.string().trim()
+    .refine(value => value.toLowerCase() !== 'true', 'Use loopback, a hop count, or proxy IPs; true would trust spoofed headers')
+    .optional()),
   WHATSAPP_PLATFORM: z.preprocess(value => value === '' ? undefined : value, z.enum(['baileys', 'fake']).default('baileys')),
 }).superRefine((value, context) => {
   if (value.WHATSAPP_PLATFORM === 'fake' && value.NODE_ENV === 'production') {
@@ -35,6 +40,12 @@ const environmentSchema = z.object({
 });
 
 export interface TelegramCredentials { apiId: number; apiHash: string }
+
+/** Express `trust proxy` value: false (off), a hop count, or Express's own string forms (`loopback`, IPs, subnets). */
+export function parseTrustProxy(value: string | undefined): false | number | string {
+  if (value === undefined || value.toLowerCase() === 'false' || value === '0') return false;
+  return /^\d+$/.test(value) ? Number(value) : value;
+}
 
 /** Validates the environment. Error messages name the variables, never their values. */
 export function parseEnvironment(environment: NodeJS.ProcessEnv) {
@@ -57,5 +68,6 @@ export function parseEnvironment(environment: NodeJS.ProcessEnv) {
     adminEmail: data.ADMIN_EMAIL,
     telegram,
     whatsappPlatform: data.WHATSAPP_PLATFORM,
+    trustProxy: parseTrustProxy(data.TRUST_PROXY),
   });
 }
