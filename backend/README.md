@@ -1,6 +1,6 @@
 # Contact Export backend
 
-Requires Node.js 22.12+ and PostgreSQL. Authentication, admin user management, and the fake connection lifecycle are implemented. Telegram and WhatsApp both use `FakePlatform`; export (`POST /connections/:id/export`) works against the fake platform; real platform integrations come later.
+Requires Node.js 22.12+ and PostgreSQL. Authentication, admin user management, and the fake connection lifecycle are implemented. Telegram uses the real `TelegramPlatform` (GramJS) when `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` are set: QR login, two-step verification, and logout work (T16), while groups and contacts come in T17–T18. Without the keys, and for WhatsApp, `FakePlatform` is used. Export (`POST /connections/:id/export`) works against the fake platform.
 
 From this folder, install dependencies with `npm ci`. Copy `.env.example` to `.env` if `.env` does not exist, then edit it:
 
@@ -21,7 +21,7 @@ npm start
 
 For development, use `npm run dev`. After changing the schema, use `npm run db:migrate -- --name descriptive_name`, followed by `npm run db:generate`. Prisma CLI connection settings live in `prisma.config.ts`.
 
-Configuration is validated once in `src/config/env.ts`: `DATABASE_URL` and a 32-character `COOKIE_SECRET` are required; `PORT` defaults to 3000, `NODE_ENV` to development, and `CONNECTION_IDLE_TIMEOUT_MS` to 600000. `ADMIN_EMAIL` is optional and reserved for future configuration; authorization uses the user's database role.
+Configuration is validated once in `src/config/env.ts`: `DATABASE_URL` and a 32-character `COOKIE_SECRET` are required; `PORT` defaults to 3000, `NODE_ENV` to development, and `CONNECTION_IDLE_TIMEOUT_MS` to 600000. `ADMIN_EMAIL` is optional and reserved for future configuration; authorization uses the user's database role. `TELEGRAM_API_ID` (a positive integer) and `TELEGRAM_API_HASH` (32 hex characters) come from my.telegram.org. Set both or neither (empty counts as unset). Without them, `telegram` uses the fake platform and startup logs `telegram: using the fake platform`; with `NODE_ENV=production`, startup fails without them. The schema lives in `src/config/env.schema.ts` (`parseEnvironment`), and error messages name variables, never values.
 
 `User` maps to `users`, and `AuditLog` to `audit_log`, with snake_case columns as specified in the plan. User IDs are database-generated UUIDs; audit IDs are bigserial. The migration also enforces the plan's allowed role and platform values with PostgreSQL check constraints. No contact data or platform sessions are stored.
 
@@ -143,9 +143,50 @@ Invoke-WebRequest -Uri "http://localhost:3000/connections/$($connection.id)/expo
     -WebSession $appSession -OutFile "$HOME\Downloads\contacts-telegram.xlsx"
 ```
 
+## Telegram (step 6)
+
+The rules are in `docs/specs/06-telegram.md`. `TelegramPlatform` (`src/platforms/telegram/telegram.platform.ts`) holds all GramJS code (`telegram@2.26.22`, pinned):
+
+- **Session:** an in-memory `StringSession('')` per connection, never saved, logged, or returned. GramJS's logger is off. The device shows as `Contact Export Tool` in Telegram → Settings → Devices.
+- **Connect:** `POST /connections` resolves as soon as the first login token exists. `qr` is `tg://login?token=<base64url>` and changes about every 30 s. If there's no token within 10 s, it returns `502 could not reach the platform; please try again` and nothing is kept or audited.
+- **Two-step verification:** after the scan, an account with a cloud password reports `password-required` (plus `passwordHint` if one is set). Then send `POST /connections/:id/password {"password":"…"}`:
+
+  | Status | Message | When |
+  | --- | --- | --- |
+  | 200 | *(connection, `connected`)* | Accepted |
+  | 400 | `password is required` | Missing, empty, over 256 characters, or extra fields |
+  | 409 | `connection is not waiting for a password` | The status isn't `password-required` |
+  | 400 | `wrong two-step verification password` | Rejected. It stays `password-required`. |
+  | 400 | `too many wrong passwords; start again` | The 5th wrong password. The connection is ended. |
+  | 502 | `could not reach the platform; please try again` | Telegram failed or asked to wait. It stays `password-required`. |
+
+  The password is passed to GramJS for the SRP check and never kept, logged, or audited. The check holds the per-user lock (up to 45 s), so status polls wait briefly.
+- **Background failures:** if the login fails after the QR is shown (for example the QR loop errors), the status becomes `disconnected` and the client is destroyed. Start again with `POST /connections`.
+- **Disconnect:** when logged in, `auth.logOut` (5 s timeout) and then the client is destroyed. Otherwise the login is cancelled and the client destroyed. It never throws, and only error class names and Telegram error codes are logged.
+- `FakePlatform` accepts `password`/`passwordHint` options to simulate two-step verification in tests.
+
+To scan without the frontend, poll the status and draw each new `qr` in the terminal (`npx` downloads `qrcode-terminal` once):
+
+```powershell
+$connection = Invoke-RestMethod -Uri 'http://localhost:3000/connections' -Method Post `
+    -ContentType 'application/json' -Body '{"platform":"telegram"}' -WebSession $appSession
+$last = ''
+do {
+    $s = Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)" -WebSession $appSession
+    if ($s.qr -and $s.qr -ne $last) { Clear-Host; npx --yes qrcode-terminal@0.12.0 $s.qr; $last = $s.qr }
+    Start-Sleep -Seconds 2
+} while ($s.status -eq 'waiting-for-scan')
+$s.status
+# Only if it says password-required:
+Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)/password" -Method Post `
+    -ContentType 'application/json' -Body (@{ password = (Read-Host 'Telegram 2FA password') } | ConvertTo-Json) -WebSession $appSession
+```
+
+In the Telegram app: Settings → Devices → Link Desktop Device, then scan. `GET /connections/:id/groups` on real Telegram fails until T17.
+
 ## Tests
 
-`npm test` runs authentication, admin authorization, user management, email capitalization, connection ownership, concurrent replacement, cleanup, fake-clock reaper, Excel writer, export service, export endpoint (errors, audit, concurrency, aborted downloads), and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
+`npm test` runs authentication, admin authorization, user management, email capitalization, connection ownership, concurrent replacement, cleanup, fake-clock reaper, Excel writer, export service, export endpoint (errors, audit, concurrency, aborted downloads), environment validation (Telegram keys), the Telegram login state machine with a scripted fake GramJS client (QR, 2FA, logout), the password endpoint, and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
 
 ```powershell
 $env:RUN_DATABASE_TESTS = '1'

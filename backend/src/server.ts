@@ -21,7 +21,8 @@ async function main() {
   const hasher = new BcryptPasswordHasher();
   const audit = new AuditService(new PrismaAuditRepository(prisma));
   const connectionRegistry = new ConnectionRegistry();
-  const connections = new ConnectionsService(connectionRegistry, createPlatform, audit, users, sessions);
+  if (!config.telegram) console.log('telegram: using the fake platform');
+  const connections = new ConnectionsService(connectionRegistry, name => createPlatform(name, { telegram: config.telegram }), audit, users, sessions);
   const reaper = new ConnectionReaper(connectionRegistry, connections, config.connectionIdleTimeoutMs);
   const auth = new AuthService(users, hasher, audit, sessions, connections);
   const userManagement = new UsersService(users, hasher, audit, sessions, connections);

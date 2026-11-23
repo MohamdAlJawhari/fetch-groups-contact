@@ -16,6 +16,7 @@ import { ConnectionsService } from '../src/modules/connections/connections.servi
 import { ConnectionReaper } from '../src/modules/connections/connection.reaper.js';
 import { FakePlatform } from '../src/platforms/fake.platform.js';
 import { createPlatform } from '../src/platforms/platform.factory.js';
+import { PlatformError } from '../src/platforms/platform.errors.js';
 import type { PlatformFactory, PlatformName } from '../src/platforms/platform.types.js';
 import type { User } from '../src/generated/prisma/client.js';
 import { ExcelWriter } from '../src/export/excel.writer.js';
@@ -629,4 +630,124 @@ test('the client aborting mid-download is audited as export_failed and ends the 
     assert.equal(f.connectionRegistry.get(id), undefined);
     assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_failed', 'connection_ended']);
   } finally { streaming.open(); await f.close(); }
+});
+
+// ---------- Two-step verification and start failures (docs/specs/06-telegram.md 3.2, 3.3) ----------
+
+const twoFactorSecret = 'Correct-2FA-secret-value';
+const twoFactorFixture = () => fixture(now => name => createPlatform(name, {now, password: twoFactorSecret, passwordHint: 'pet name'}));
+async function awaitingPassword(f: Awaited<ReturnType<typeof fixture>>) {
+  const cookie = await f.login(f.a);
+  const connection = await f.start(cookie);
+  f.advance(3_000);
+  return {cookie, id: connection.id, submit: (body: unknown) => f.request('POST', `/connections/${connection.id}/password`, cookie, body)};
+}
+
+test('password step: password-required with the hint, a wrong password keeps it, the right one connects', async (t) => {
+  const logs = [t.mock.method(console, 'error', () => {}), t.mock.method(console, 'log', () => {})];
+  const f = await twoFactorFixture();
+  try {
+    const {cookie, id, submit} = await awaitingPassword(f);
+    assert.deepEqual(await (await f.request('GET', `/connections/${id}`, cookie)).json(),
+      {id, platform: 'telegram', status: 'password-required', passwordHint: 'pet name'});
+    assert.equal((await f.request('GET', `/connections/${id}/groups`, cookie)).status, 409);
+    const wrong = await submit({password: 'Wrong-secret-value'});
+    assert.equal(wrong.status, 400);
+    assert.deepEqual(await wrong.json(), {message: 'wrong two-step verification password'});
+    assert.equal((await (await f.request('GET', `/connections/${id}`, cookie)).json() as {status: string}).status, 'password-required');
+    const right = await submit({password: twoFactorSecret});
+    assert.equal(right.status, 200);
+    assert.equal(right.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(await right.json(), {id, platform: 'telegram', status: 'connected'});
+    assert.equal((await f.request('GET', `/connections/${id}/groups`, cookie)).status, 200);
+    const again = await submit({password: twoFactorSecret});
+    assert.equal(again.status, 409);
+    assert.deepEqual(await again.json(), {message: 'connection is not waiting for a password'});
+    const logged = JSON.stringify(logs.flatMap(log => log.mock.calls.map(call => call.arguments)));
+    assert.doesNotMatch(logged, /2FA-secret|Wrong-secret|pet name/);
+    assert.doesNotMatch(JSON.stringify(f.events), /secret|pet name/i);
+    assert.deepEqual(f.events.filter(event => event.action.startsWith('connection_')).map(event => event.action), ['connection_started']);
+  } finally { await f.close(); }
+});
+
+test('password step: the 5th wrong password ends the connection once', async () => {
+  const f = await twoFactorFixture();
+  try {
+    const {cookie, id, submit} = await awaitingPassword(f);
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      assert.deepEqual(await (await submit({password: `wrong-${attempt}`})).json(), {message: 'wrong two-step verification password'});
+    }
+    const fifth = await submit({password: 'wrong-5'});
+    assert.equal(fifth.status, 400);
+    assert.deepEqual(await fifth.json(), {message: 'too many wrong passwords; start again'});
+    assert.equal(f.connectionRegistry.get(id), undefined);
+    assert.equal((await f.request('GET', `/connections/${id}`, cookie)).status, 404);
+    assert.equal((await submit({password: twoFactorSecret})).status, 404);
+    assert.deepEqual(f.events.filter(event => event.action.startsWith('connection_')).map(event => event.action),
+      ['connection_started', 'connection_ended']);
+  } finally { await f.close(); }
+});
+
+test('password step: validation, ownership, auth, and platforms without a password step', async () => {
+  const f = await twoFactorFixture();
+  try {
+    const {id, submit} = await awaitingPassword(f);
+    for (const body of [{}, {password: ''}, {password: 'x'.repeat(257)}, {password: 123}, {password: 'ok', extra: 1}, []]) {
+      const response = await submit(body);
+      assert.equal(response.status, 400, JSON.stringify(body));
+      assert.deepEqual(await response.json(), {message: 'password is required'});
+    }
+    const otherUser = await f.login(f.b);
+    assert.equal((await f.request('POST', `/connections/${id}/password`, otherUser, {password: twoFactorSecret})).status, 404);
+    assert.equal((await f.request('POST', `/connections/${'0'.repeat(64)}/password`, otherUser, {password: 'x'})).status, 404);
+    assert.equal((await f.request('POST', `/connections/${id}/password`, '', {password: twoFactorSecret})).status, 401);
+    assert.equal((await submit({password: 'x'.repeat(256)})).status, 400); // 256 characters is allowed, just wrong
+  } finally { await f.close(); }
+  const plain = await fixture();
+  try {
+    for (const platform of ['telegram', 'whatsapp'] as const) {
+      const cookie = await plain.login(plain.a);
+      const connection = await plain.start(cookie, platform);
+      const submit = () => plain.request('POST', `/connections/${connection.id}/password`, cookie, {password: 'anything'});
+      assert.equal((await submit()).status, 409); // still waiting for the scan
+      plain.advance(3_000);
+      assert.equal((await submit()).status, 409); // connected, no password step
+    }
+  } finally { await plain.close(); }
+});
+
+test('password step: a platform failure returns 502 and keeps the password step', async () => {
+  const f = await fixture(now => name => {
+    class FlakyPlatform extends FakePlatform {
+      override async submitPassword(): Promise<void> { throw new Error('FLOOD_WAIT'); }
+    }
+    return new FlakyPlatform(name, {now, password: twoFactorSecret});
+  });
+  try {
+    const {cookie, id, submit} = await awaitingPassword(f);
+    const response = await submit({password: twoFactorSecret});
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), {message: 'could not reach the platform; please try again'});
+    assert.equal((await (await f.request('GET', `/connections/${id}`, cookie)).json() as {status: string}).status, 'password-required');
+  } finally { await f.close(); }
+});
+
+test('POST /connections returns 502 when the platform cannot produce a QR code, keeping and auditing nothing', async () => {
+  const disconnected: string[] = [];
+  const f = await fixture(now => name => {
+    class UnreachablePlatform extends FakePlatform {
+      override async connect(): Promise<void> { throw new PlatformError('unavailable'); }
+      override async disconnect(): Promise<void> { disconnected.push(name); }
+    }
+    return new UnreachablePlatform(name, {now});
+  });
+  try {
+    const cookie = await f.login(f.a);
+    const response = await f.request('POST', '/connections', cookie, {platform: 'telegram'});
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), {message: 'could not reach the platform; please try again'});
+    assert.deepEqual(disconnected, ['telegram']);
+    assert.deepEqual(f.connectionRegistry.entries(), []);
+    assert.equal(f.events.some(event => event.action.startsWith('connection_')), false);
+  } finally { await f.close(); }
 });

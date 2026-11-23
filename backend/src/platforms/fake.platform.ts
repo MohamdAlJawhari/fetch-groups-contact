@@ -1,22 +1,38 @@
+import { PlatformError } from './platform.errors.js';
 import type { CategorizedContacts, Platform, PlatformName, PlatformStatus } from './platform.types.js';
 
-export interface FakePlatformOptions { now?: () => number; scanDelayMs?: number }
+export interface FakePlatformOptions {
+  now?: () => number;
+  scanDelayMs?: number;
+  /** Simulates two-step verification: after the scan, `password-required` until this password is submitted. */
+  password?: string;
+  passwordHint?: string;
+}
 
 export class FakePlatform implements Platform {
   private connectedAt: number | undefined;
+  private passwordAccepted = false;
   private readonly now: () => number;
   private readonly scanDelayMs: number;
-  constructor(private readonly name: PlatformName, options: FakePlatformOptions = {}) {
+  constructor(private readonly name: PlatformName, private readonly options: FakePlatformOptions = {}) {
     this.now = options.now ?? Date.now;
     this.scanDelayMs = options.scanDelayMs ?? 3_000;
   }
-  async connect() { this.connectedAt = this.now(); }
+  async connect() { this.connectedAt = this.now(); this.passwordAccepted = false; }
   async getStatus(): Promise<PlatformStatus> {
     if (this.connectedAt === undefined) return { status: 'disconnected' };
     if (this.now() - this.connectedAt < this.scanDelayMs) {
       return { status: 'waiting-for-scan', qr: `FAKE_QR:${this.name}:scan-placeholder` };
     }
+    if (this.options.password !== undefined && !this.passwordAccepted) {
+      return this.options.passwordHint ? { status: 'password-required', passwordHint: this.options.passwordHint } : { status: 'password-required' };
+    }
     return { status: 'connected' };
+  }
+  async submitPassword(password: string) {
+    if ((await this.getStatus()).status !== 'password-required') throw new Error('Platform is not waiting for a password');
+    if (password !== this.options.password) throw new PlatformError('wrong_password');
+    this.passwordAccepted = true;
   }
   async listGroups() {
     await this.requireConnected();
@@ -36,7 +52,7 @@ export class FakePlatform implements Platform {
       { category: 'unsaved_unreachable', contacts: [{ id: 'sample-unreachable', name: 'Sample unreachable contact' }] },
     ];
   }
-  async disconnect() { this.connectedAt = undefined; }
+  async disconnect() { this.connectedAt = undefined; this.passwordAccepted = false; }
   private async requireConnected() {
     if ((await this.getStatus()).status !== 'connected') throw new Error('Platform is not connected');
   }

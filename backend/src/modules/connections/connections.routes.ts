@@ -7,6 +7,7 @@ export function createConnectionsRoutes(controller: ConnectionsController, authe
   router.use(authenticate);
   router.post('/', controller.start);
   router.get('/:id', owned, controller.status);
+  router.post('/:id/password', owned, controller.password);
   router.get('/:id/groups', owned, controller.groups);
   router.post('/:id/export', owned, controller.export);
   router.delete('/:id', owned, controller.disconnect);

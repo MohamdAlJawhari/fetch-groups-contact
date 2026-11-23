@@ -7,6 +7,7 @@ const startSchema = z.object({ platform: z.enum(['telegram', 'whatsapp']) }).str
 const exportSchema = z.object({
   groupIds: z.array(z.string().min(1).max(256)).min(1).max(50).refine(ids => new Set(ids).size === ids.length),
 }).strict();
+const passwordSchema = z.object({ password: z.string().min(1).max(256) }).strict();
 const XLSX = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
 export class ConnectionsController {
@@ -18,6 +19,11 @@ export class ConnectionsController {
   };
   status = async (request: Request, response: Response) => {
     response.json(await this.connections.status(request.user!.id, request.params.id as string));
+  };
+  password = async (request: Request, response: Response) => {
+    const parsed = passwordSchema.safeParse(request.body);
+    if (!parsed.success) throw new AppError(400, 'password is required');
+    response.json(await this.connections.submitPassword(request.user!.id, request.params.id as string, parsed.data.password));
   };
   groups = async (request: Request, response: Response) => {
     response.json({ groups: await this.connections.groups(request.user!.id, request.params.id as string) });

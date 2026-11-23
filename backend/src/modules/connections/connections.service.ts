@@ -1,6 +1,7 @@
 import type { Writable } from 'node:stream';
 import { AppError } from '../../shared/errors.js';
 import { ExportService } from '../../export/export.service.js';
+import { PlatformError } from '../../platforms/platform.errors.js';
 import type { CategorizedContacts, PlatformFactory, PlatformName } from '../../platforms/platform.types.js';
 import type { AuditService } from '../audit/audit.service.js';
 import type { UserRepository } from '../users/users.repository.js';
@@ -8,6 +9,8 @@ import type { SessionStore } from '../auth/session.store.js';
 import { ConnectionRegistry, type ConnectionEntry } from './connection.registry.js';
 
 const PLATFORM_READ_FAILURE = 'could not read contacts from the platform; please try again';
+const PLATFORM_UNREACHABLE = 'could not reach the platform; please try again';
+const MAX_WRONG_PASSWORDS = 5;
 
 /** A fetched export, ready to stream. `write` never rejects: failures cut the stream off and are audited. */
 export interface ExportJob {
@@ -54,8 +57,29 @@ export class ConnectionsService {
           if (entry) this.registry.remove(entry.id);
           await platform.disconnect();
         }
+        if (error instanceof PlatformError && error.code === 'unavailable') throw new AppError(502, PLATFORM_UNREACHABLE);
         throw error;
       }
+    });
+  }
+
+  /** docs/specs/06-telegram.md 3.3. The password is passed on and never kept, logged, or audited. */
+  submitPassword(ownerId: string, id: string, password: string) {
+    return this.withOwner(ownerId, async () => {
+      const entry = this.owned(ownerId, id);
+      if (!entry.platform.submitPassword || (await entry.platform.getStatus()).status !== 'password-required') {
+        throw new AppError(409, 'connection is not waiting for a password');
+      }
+      try {
+        await entry.platform.submitPassword(password);
+      } catch (error) {
+        if (!(error instanceof PlatformError && error.code === 'wrong_password')) throw new AppError(502, PLATFORM_UNREACHABLE);
+        entry.wrongPasswords += 1;
+        if (entry.wrongPasswords < MAX_WRONG_PASSWORDS) throw new AppError(400, 'wrong two-step verification password');
+        await this.end(entry);
+        throw new AppError(400, 'too many wrong passwords; start again');
+      }
+      return this.view(entry);
     });
   }
 

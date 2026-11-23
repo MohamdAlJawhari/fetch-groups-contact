@@ -11,6 +11,8 @@ export interface ConnectionEntry {
   exporting: boolean;
   /** Set while an export streams; ending the connection calls it to cut the download off. */
   abortExport?: () => void;
+  /** Wrong 2FA passwords so far; the 5th ends the connection (docs/specs/06-telegram.md 3.3). */
+  wrongPasswords: number;
 }
 
 export class ConnectionRegistry {
@@ -20,7 +22,7 @@ export class ConnectionRegistry {
   add(ownerId: string, platformName: PlatformName, platform: Platform) {
     if (this.owners.has(ownerId)) throw new Error('User already has a connection');
     const id = randomBytes(32).toString('hex');
-    const entry: ConnectionEntry = { id, ownerId, platformName, platform, lastActivity: this.now(), exporting: false };
+    const entry: ConnectionEntry = { id, ownerId, platformName, platform, lastActivity: this.now(), exporting: false, wrongPasswords: 0 };
     this.connections.set(id, entry);
     this.owners.set(ownerId, id);
     return entry;
