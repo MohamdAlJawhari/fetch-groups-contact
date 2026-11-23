@@ -1,6 +1,6 @@
 # Contact Export backend
 
-Requires Node.js 22.12+ and PostgreSQL. Authentication, admin user management, and the fake connection lifecycle are implemented. Telegram uses the real `TelegramPlatform` (GramJS) when `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` are set: QR login, two-step verification, and logout work (T16), while groups and contacts come in T17–T18. Without the keys, and for WhatsApp, `FakePlatform` is used. Export (`POST /connections/:id/export`) works against the fake platform.
+Requires Node.js 22.12+ and PostgreSQL. Authentication, admin user management, and the fake connection lifecycle are implemented. Telegram uses the real `TelegramPlatform` (GramJS) when `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` are set: QR login, two-step verification, logout (T16), and the group list (T17) work, while contacts come in T18. Without the keys, and for WhatsApp, `FakePlatform` is used. Export (`POST /connections/:id/export`) works against the fake platform.
 
 From this folder, install dependencies with `npm ci`. Copy `.env.example` to `.env` if `.env` does not exist, then edit it:
 
@@ -163,6 +163,9 @@ The rules are in `docs/specs/06-telegram.md`. `TelegramPlatform` (`src/platforms
   The password is passed to GramJS for the SRP check and never kept, logged, or audited. The check holds the per-user lock (up to 45 s), so status polls wait briefly.
 - **Background failures:** if the login fails after the QR is shown (for example the QR loop errors), the status becomes `disconnected` and the client is destroyed. Start again with `POST /connections`.
 - **Disconnect:** when logged in, `auth.logOut` (5 s timeout) and then the client is destroyed. Otherwise the login is cancelled and the client destroyed. It never throws, and only error class names and Telegram error codes are logged.
+- **Groups (T17):** `listGroups` pages through `messages.getDialogs` itself (100 dialogs per request, including archived chats) and keeps basic groups and supergroups the user is still in. Broadcast channels, private chats, migrated or deactivated groups, left groups, and forbidden chats are dropped. IDs are GramJS marked peer IDs (`-123…` basic, `-100…` supergroup), in dialog order. GramJS's own dialog iterator isn't used, because it pages without our throttle and prints message objects to the console on a parsing error.
+- **Throttle** (`telegram.throttle.ts`, one per connection): one request at a time, at least 1 s between starts. GramJS sleeps out a `FLOOD_WAIT` of 30 s or less. A longer one blocks every further request on that connection until it has passed, failing them at once (only `Telegram flood wait` and the seconds are logged).
+- `GET /connections/:id/groups` returns `502 could not read contacts from the platform; please try again` when the platform fails, and the connection is kept.
 - `FakePlatform` accepts `password`/`passwordHint` options to simulate two-step verification in tests.
 
 To scan without the frontend, poll the status and draw each new `qr` in the terminal (`npx` downloads `qrcode-terminal` once):
@@ -182,11 +185,11 @@ Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)/pass
     -ContentType 'application/json' -Body (@{ password = (Read-Host 'Telegram 2FA password') } | ConvertTo-Json) -WebSession $appSession
 ```
 
-In the Telegram app: Settings → Devices → Link Desktop Device, then scan. `GET /connections/:id/groups` on real Telegram fails until T17.
+In the Telegram app: Settings → Devices → Link Desktop Device, then scan. Then `Invoke-RestMethod "http://localhost:3000/connections/$($connection.id)/groups" -WebSession $appSession` lists the groups. `/export` on real Telegram fails until T18.
 
 ## Tests
 
-`npm test` runs authentication, admin authorization, user management, email capitalization, connection ownership, concurrent replacement, cleanup, fake-clock reaper, Excel writer, export service, export endpoint (errors, audit, concurrency, aborted downloads), environment validation (Telegram keys), the Telegram login state machine with a scripted fake GramJS client (QR, 2FA, logout), the password endpoint, and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
+`npm test` runs authentication, admin authorization, user management, email capitalization, connection ownership, concurrent replacement, cleanup, fake-clock reaper, Excel writer, export service, export endpoint (errors, audit, concurrency, aborted downloads), environment validation (Telegram keys), the Telegram login state machine with a scripted fake GramJS client (QR, 2FA, logout), the password endpoint, the Telegram group filter, dialog paging against real GramJS objects, the throttle (fake clock), and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
 
 ```powershell
 $env:RUN_DATABASE_TESTS = '1'

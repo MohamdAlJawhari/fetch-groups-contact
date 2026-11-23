@@ -352,8 +352,12 @@ test('platform failures never log QR values or contact details', async (t) => {
     const connection = await f.start(cookie);
     f.advance(3_000);
     const response = await f.request('GET', `/connections/${connection.id}/groups`, cookie);
-    assert.equal(response.status, 500);
-    assert.equal((await response.text()).includes(secret), false);
+    assert.equal(response.status, 502);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    const body = await response.text();
+    assert.deepEqual(JSON.parse(body), {message: 'could not read contacts from the platform; please try again'});
+    assert.equal(body.includes(secret), false);
+    assert.equal(f.connectionRegistry.get(connection.id)?.id, connection.id); // the connection is kept
     assert.equal(logger.mock.callCount(), 1);
     assert.equal(JSON.stringify(logger.mock.calls.map(call => call.arguments)).includes(secret), false);
     assert.equal(JSON.stringify(f.events).includes(secret), false);

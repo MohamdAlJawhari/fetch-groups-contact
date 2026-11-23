@@ -92,7 +92,8 @@ export class ConnectionsService {
       if ((await entry.platform.getStatus()).status !== 'connected') {
         throw new AppError(409, 'connection is not connected yet');
       }
-      return entry.platform.listGroups();
+      try { return await entry.platform.listGroups(); }
+      catch { throw new AppError(502, PLATFORM_READ_FAILURE); }
     });
   }
   /**

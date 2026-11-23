@@ -23,6 +23,7 @@ class FakeTelegramClient implements TelegramClientAdapter {
       if (this.emitQrOnLogin) callbacks.qrCode(Buffer.from('token-1')).catch(reject);
     });
   }
+  async getDialogs() { return { chats: [] }; }
   async logOut() { this.calls.push('logOut'); if (this.failLogout) throw new Error('network down'); }
   async destroy() { this.calls.push('destroy'); }
   scan() { this.login!.resolve(); }

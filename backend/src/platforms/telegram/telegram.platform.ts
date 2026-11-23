@@ -1,9 +1,12 @@
 import { Api, Logger, TelegramClient } from 'telegram';
 import { LogLevel } from 'telegram/extensions/Logger.js';
+import { returnBigInt } from 'telegram/Helpers.js';
 import { StringSession } from 'telegram/sessions/index.js';
+import { getPeerId } from 'telegram/Utils.js';
 import type { TelegramCredentials } from '../../config/env.schema.js';
 import { PlatformError } from '../platform.errors.js';
 import type { CategorizedContacts, Group, Platform, PlatformStatus } from '../platform.types.js';
+import { TelegramThrottle } from './telegram.throttle.js';
 
 /** The GramJS login callbacks the platform hands to the client (docs/specs/06-telegram.md 4.3). */
 export interface TelegramLoginCallbacks {
@@ -13,11 +16,29 @@ export interface TelegramLoginCallbacks {
   onError(error: Error): Promise<boolean>;
 }
 
+/** A chat from the dialog list, copied out of GramJS objects (spec 06, 4.4). */
+export interface TelegramChatRecord {
+  /** `chat` = basic group, `channel` = supergroup or broadcast channel, `unavailable` = forbidden or empty. */
+  kind: 'chat' | 'channel' | 'unavailable';
+  /** GramJS's marked peer ID: `-123` for basic groups, `-100123` for channels and supergroups. */
+  id: string;
+  title: string;
+  left?: boolean;
+  deactivated?: boolean;
+  migrated?: boolean;
+  megagroup?: boolean;
+}
+
+/** One `messages.getDialogs` request. `next` is an opaque offset for the following page, absent on the last one. */
+export interface TelegramDialogPage { chats: TelegramChatRecord[]; next?: unknown }
+
 /** The small slice of GramJS the platform uses, so the state machine can be tested without a network. */
 export interface TelegramClientAdapter {
   connect(): Promise<void>;
   /** Resolves once logged in (after the scan, and the 2FA password if any). */
   loginWithQr(callbacks: TelegramLoginCallbacks): Promise<void>;
+  /** Exactly one Telegram request per call, so the platform can throttle every page. */
+  getDialogs(offset?: unknown): Promise<TelegramDialogPage>;
   logOut(): Promise<void>;
   destroy(): Promise<void>;
 }
@@ -32,6 +53,29 @@ export interface TelegramPlatformOptions {
   passwordTimeoutMs?: number;
   /** Timeout for auth.logOut and for destroying the client (spec 4.8: 5 s). */
   logoutTimeoutMs?: number;
+  /** Tests pass a throttle with a fake clock. */
+  throttle?: TelegramThrottle;
+}
+
+/** Safety cap on dialog pages (100 dialogs each), so a paging bug cannot loop forever. */
+const MAX_DIALOG_PAGES = 100;
+
+/**
+ * Pure filter (spec 4.4): basic groups and supergroups the user is still in, once each, in dialog order.
+ * Broadcast channels, migrated or deactivated groups, left groups, and forbidden chats are dropped.
+ */
+export function selectTelegramGroups(chats: readonly TelegramChatRecord[]): Group[] {
+  const seen = new Set<string>();
+  const groups: Group[] = [];
+  for (const chat of chats) {
+    const keep = chat.kind === 'chat' ? !chat.left && !chat.deactivated && !chat.migrated
+      : chat.kind === 'channel' ? chat.megagroup === true && !chat.left
+      : false;
+    if (!keep || seen.has(chat.id)) continue;
+    seen.add(chat.id);
+    groups.push({ id: chat.id, title: chat.title });
+  }
+  return groups;
 }
 
 type State = 'idle' | 'waiting' | 'password' | 'connected' | 'disconnected';
@@ -81,8 +125,10 @@ export class TelegramPlatform implements Platform {
   private readonly connectTimeoutMs: number;
   private readonly passwordTimeoutMs: number;
   private readonly logoutTimeoutMs: number;
+  private readonly throttle: TelegramThrottle;
 
   constructor(private readonly options: TelegramPlatformOptions) {
+    this.throttle = options.throttle ?? new TelegramThrottle();
     this.connectTimeoutMs = options.connectTimeoutMs ?? 10_000;
     this.passwordTimeoutMs = options.passwordTimeoutMs ?? 45_000;
     this.logoutTimeoutMs = options.logoutTimeoutMs ?? 5_000;
@@ -180,7 +226,22 @@ export class TelegramPlatform implements Platform {
   }
 
   async listGroups(): Promise<Group[]> {
-    throw new Error('Telegram groups are not implemented yet (T17)');
+    const client = this.client;
+    if (this.state !== 'connected' || !client) throw new Error('Telegram platform is not connected');
+    try {
+      const chats: TelegramChatRecord[] = [];
+      let offset: unknown;
+      for (let page = 0; page < MAX_DIALOG_PAGES; page++) {
+        const result = await this.throttle.run(() => client.getDialogs(offset));
+        chats.push(...result.chats);
+        if (result.next === undefined) break;
+        offset = result.next;
+      }
+      return selectTelegramGroups(chats);
+    } catch (error) {
+      console.error('Telegram listGroups failed', describeTelegramError(error));
+      throw error;
+    }
   }
 
   async listContacts(_groupIds: readonly string[]): Promise<CategorizedContacts> {
@@ -232,8 +293,66 @@ export function gramJsClientMaker(credentials: TelegramCredentials): TelegramCli
           onError: (error) => callbacks.onError(error),
         });
       },
+      async getDialogs(offset) { return readDialogPage(client, offset as DialogOffset | undefined); },
       async logOut() { await client.invoke(new Api.auth.LogOut()); },
       async destroy() { await client.destroy(); },
     };
   };
+}
+
+const DIALOG_PAGE_SIZE = 100;
+interface DialogOffset { date: number; id: number; peer: Api.TypeEntityLike }
+
+function toChatRecord(chat: Api.TypeChat): TelegramChatRecord {
+  if (chat instanceof Api.Chat) {
+    return { kind: 'chat', id: getPeerId(chat), title: chat.title, left: chat.left, deactivated: chat.deactivated,
+      // Absent optional fields arrive as `null` from Telegram (not `undefined`), so test for a real value.
+      migrated: Boolean(chat.migratedTo) && !(chat.migratedTo instanceof Api.InputChannelEmpty) };
+  }
+  if (chat instanceof Api.Channel) {
+    return { kind: 'channel', id: getPeerId(chat), title: chat.title, left: chat.left, megagroup: chat.megagroup };
+  }
+  return { kind: 'unavailable', id: '', title: '' };
+}
+
+/**
+ * One raw `messages.getDialogs` page. GramJS's own dialog iterator is avoided on purpose: it pages without our
+ * throttle, and on a parsing error it prints whole message objects to the console (privacy, spec 4.9).
+ * The next offset follows GramJS's iterator: the last dialog's top message date and id, and its peer.
+ */
+export async function readDialogPage(client: Pick<TelegramClient, 'invoke'>, offset: DialogOffset | undefined): Promise<TelegramDialogPage> {
+  const result = await client.invoke(new Api.messages.GetDialogs({
+    offsetDate: offset?.date ?? 0,
+    offsetId: offset?.id ?? 0,
+    offsetPeer: offset?.peer ?? new Api.InputPeerEmpty(),
+    limit: DIALOG_PAGE_SIZE,
+    hash: returnBigInt(0),
+    excludePinned: offset !== undefined, // pinned dialogs come only on the first page
+  }));
+  if (result instanceof Api.messages.DialogsNotModified) return { chats: [] };
+  const chatEntities = new Map<string, Api.TypeChat>();
+  for (const chat of result.chats) if (!(chat instanceof Api.ChatEmpty)) chatEntities.set(getPeerId(chat), chat);
+  const entities = new Map<string, Api.TypeUser | Api.TypeChat>(chatEntities);
+  for (const user of result.users) if (!(user instanceof Api.UserEmpty)) entities.set(getPeerId(user), user);
+  const dialogs = result.dialogs.filter((dialog): dialog is Api.Dialog => dialog instanceof Api.Dialog);
+  const chats: TelegramChatRecord[] = [];
+  for (const dialog of dialogs) {
+    if (!(dialog.peer instanceof Api.PeerChat || dialog.peer instanceof Api.PeerChannel)) continue;
+    const chat = chatEntities.get(getPeerId(dialog.peer));
+    if (chat) chats.push(toChatRecord(chat));
+  }
+  if (!(result instanceof Api.messages.DialogsSlice) || result.dialogs.length < DIALOG_PAGE_SIZE) return { chats };
+  const messages = new Map<string, Api.Message | Api.MessageService>();
+  for (const message of result.messages) {
+    if (message instanceof Api.Message || message instanceof Api.MessageService) messages.set(`${getPeerId(message.peerId)}:${message.id}`, message);
+  }
+  let last: Api.Message | Api.MessageService | undefined;
+  for (const dialog of [...dialogs].reverse()) {
+    last = messages.get(`${getPeerId(dialog.peer)}:${dialog.topMessage}`);
+    if (last) break;
+  }
+  const lastDialog = dialogs.at(-1);
+  const lastPeer = lastDialog ? entities.get(getPeerId(lastDialog.peer)) : undefined;
+  if (!last || !lastPeer) return { chats }; // no safe offset: stop rather than loop
+  return { chats, next: { date: last.date, id: last.id, peer: lastPeer } satisfies DialogOffset };
 }
