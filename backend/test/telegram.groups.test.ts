@@ -107,6 +107,9 @@ class PagingClient implements TelegramClientAdapter {
     if (page instanceof Error) throw page;
     return page;
   }
+  async isChannelHidden() { return false; }
+  async getChatMembers() { return { members: [], hidden: false }; }
+  async getChannelMembers() { return { members: [], returned: 0, count: 0 }; }
   async logOut() {}
   async destroy() {}
 }
@@ -121,11 +124,13 @@ async function connectedPlatform(pages: Array<TelegramDialogPage | Error>) {
   return { client, platform, clock };
 }
 
+const teamRef = { kind: 'channel', channelId: '1', accessHash: '10' } as const;
+
 test('listGroups pages through the dialogs, one throttled request per page, and filters them', async () => {
   const { client, platform, clock } = await connectedPlatform([
-    { chats: [{ kind: 'channel', id: '-1001', title: 'Team', megagroup: true }, { kind: 'channel', id: '-1002', title: 'News', megagroup: false }], next: 'offset-1' },
-    { chats: [{ kind: 'chat', id: '-3', title: 'Family' }], next: 'offset-2' },
-    { chats: [{ kind: 'channel', id: '-1001', title: 'Team', megagroup: true }] },
+    { chats: [{ kind: 'channel', id: '-1001', title: 'Team', megagroup: true, ref: teamRef }, { kind: 'channel', id: '-1002', title: 'News', megagroup: false, ref: { kind: 'channel', channelId: '2', accessHash: '20' } }], next: 'offset-1' },
+    { chats: [{ kind: 'chat', id: '-3', title: 'Family', ref: { kind: 'chat', chatId: '3' } }], next: 'offset-2' },
+    { chats: [{ kind: 'channel', id: '-1001', title: 'Team', megagroup: true, ref: teamRef }] },
   ]);
   assert.deepEqual(await platform.listGroups(), [{ id: '-1001', title: 'Team' }, { id: '-3', title: 'Family' }]);
   assert.deepEqual(client.offsets, [undefined, 'offset-1', 'offset-2']);
@@ -220,4 +225,21 @@ test('readDialogPage stops on a complete list or a short page', async () => {
   assert.equal((await readDialogPage({ invoke: async () => complete } as never, undefined)).next, undefined);
   const short = new Api.messages.DialogsSlice({ count: 500, dialogs: complete.dialogs, messages: complete.messages, chats: [basic], users: [] });
   assert.equal((await readDialogPage({ invoke: async () => short } as never, undefined)).next, undefined);
+});
+
+test('chat records carry the IDs member requests need; a supergroup without an access hash is not listed', async () => {
+  const noHash = new Api.Channel({ id: long(666), title: 'No hash', megagroup: true, photo: new Api.ChatPhotoEmpty(), date: 1 });
+  (noHash as unknown as Record<string, unknown>).accessHash = null; // as Telegram sends a "min" channel
+  const page = new Api.messages.Dialogs({
+    dialogs: [dialog(new Api.PeerChannel({ channelId: long(111) }), 10), dialog(new Api.PeerChat({ chatId: long(333) }), 50), dialog(new Api.PeerChannel({ channelId: long(666) }), 60)],
+    messages: [], chats: [supergroup, basic, noHash], users: [] });
+  const { chats } = await readDialogPage({ invoke: async () => page } as never, undefined);
+  assert.deepEqual(chats.map(chat => chat.ref), [
+    { kind: 'channel', channelId: '111', accessHash: '9' },
+    { kind: 'chat', chatId: '333' },
+    undefined,
+  ]);
+  const { platform } = await connectedPlatform([{ chats }]);
+  assert.deepEqual(await platform.listGroups(), [{ id: '-100111', title: 'Supergroup' }, { id: '-333', title: 'Basic' }]);
+  await platform.disconnect();
 });

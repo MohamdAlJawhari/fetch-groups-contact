@@ -24,5 +24,6 @@ export const errorHandler: ErrorRequestHandler = (error, request, response, _nex
     : request.path === '/auth/login' ? LOGIN_FAILURE
     : error instanceof AppError ? error.message
     : status === 400 ? 'invalid JSON' : status === 413 ? 'request too large' : 'internal server error';
-  response.status(status).json({ message });
+  const groupIds = error instanceof AppError && status === 400 ? error.groupIds : undefined;
+  response.status(status).json(groupIds ? { message, groupIds } : { message });
 };

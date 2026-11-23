@@ -24,6 +24,9 @@ class FakeTelegramClient implements TelegramClientAdapter {
     });
   }
   async getDialogs() { return { chats: [] }; }
+  async isChannelHidden() { return false; }
+  async getChatMembers() { return { members: [], hidden: false }; }
+  async getChannelMembers() { return { members: [], returned: 0, count: 0 }; }
   async logOut() { this.calls.push('logOut'); if (this.failLogout) throw new Error('network down'); }
   async destroy() { this.calls.push('destroy'); }
   scan() { this.login!.resolve(); }

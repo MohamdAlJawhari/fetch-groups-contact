@@ -736,6 +736,34 @@ test('password step: a platform failure returns 502 and keeps the password step'
   } finally { await f.close(); }
 });
 
+test('export: a group with a hidden member list returns 400 with only selected groupIds, audits export_failed, keeps the connection', async () => {
+  const f = await fixture(now => name => {
+    class HiddenMembersPlatform extends FakePlatform {
+      override async listContacts(groupIds: readonly string[]) {
+        if (groupIds.includes('sample-group-2')) throw new PlatformError('members_hidden', ['sample-group-2', 'not-selected-group']);
+        return super.listContacts(groupIds);
+      }
+    }
+    return new HiddenMembersPlatform(name, {now});
+  });
+  try {
+    const {cookie, id} = await connected(f);
+    const response = await f.request('POST', `/connections/${id}/export`, cookie, groups);
+    assert.equal(response.status, 400);
+    assert.equal(response.headers.get('content-type')?.startsWith('application/json'), true);
+    assert.deepEqual(await response.json(), {message: 'a selected group hides its member list', groupIds: ['sample-group-2']});
+    assert.equal((await (await f.request('GET', `/connections/${id}`, cookie)).json() as {status: string}).status, 'connected');
+    assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_failed']);
+    assert.doesNotMatch(JSON.stringify(f.events), /sample-group/);
+    // Deselecting the hidden group works without a new scan.
+    const retry = await f.request('POST', `/connections/${id}/export`, cookie, {groupIds: ['sample-group-1']});
+    assert.equal(retry.status, 200);
+    await retry.arrayBuffer();
+    await waitFor(() => f.events.some(event => event.action === 'connection_ended'));
+    assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_failed', 'export_started', 'export_finished', 'connection_ended']);
+  } finally { await f.close(); }
+});
+
 test('POST /connections returns 502 when the platform cannot produce a QR code, keeping and auditing nothing', async () => {
   const disconnected: string[] = [];
   const f = await fixture(now => name => {

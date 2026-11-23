@@ -119,12 +119,18 @@ export class ConnectionsService {
     let contacts: CategorizedContacts;
     try {
       contacts = await this.exporter.prepare(entry.platform, groupIds);
-    } catch {
+    } catch (error) {
       throw await this.withOwner(ownerId, async () => {
         const live = this.isLive(entry);
         if (live) { entry.exporting = false; this.registry.touch(entry.id); }
         await this.audit.record(ownerId, 'export_failed', entry.platformName);
-        return live ? new AppError(502, PLATFORM_READ_FAILURE) : new AppError(404, 'connection not found');
+        if (!live) return new AppError(404, 'connection not found');
+        if (error instanceof PlatformError && error.code === 'members_hidden') {
+          // Only IDs the user selected, so nothing new leaks (spec 06, 3.4).
+          const hidden = (error.groupIds ?? []).filter(groupId => groupIds.includes(groupId));
+          return new AppError(400, 'a selected group hides its member list', hidden);
+        }
+        return new AppError(502, PLATFORM_READ_FAILURE);
       });
     }
     const state: StreamState = { aborted: false };

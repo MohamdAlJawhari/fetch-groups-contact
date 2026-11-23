@@ -6,6 +6,7 @@ import { getPeerId } from 'telegram/Utils.js';
 import type { TelegramCredentials } from '../../config/env.schema.js';
 import { PlatformError } from '../platform.errors.js';
 import type { CategorizedContacts, Group, Platform, PlatformStatus } from '../platform.types.js';
+import { categorizeTelegramMembers, type TelegramMember } from './telegram.categorizer.js';
 import { TelegramThrottle } from './telegram.throttle.js';
 
 /** The GramJS login callbacks the platform hands to the client (docs/specs/06-telegram.md 4.3). */
@@ -27,7 +28,17 @@ export interface TelegramChatRecord {
   deactivated?: boolean;
   migrated?: boolean;
   megagroup?: boolean;
+  /** What member requests need: the raw chat or channel ID, and the channel access hash. */
+  ref?: TelegramGroupRef;
 }
+
+/** How to address a group in member requests. IDs and hashes are decimal strings (no bigint in our code). */
+export type TelegramGroupRef =
+  | { kind: 'chat'; chatId: string }
+  | { kind: 'channel'; channelId: string; accessHash: string };
+
+/** One `channels.getParticipants` page: the members on it, how many participants it held, and Telegram's total. */
+export interface TelegramMemberPage { members: TelegramMember[]; returned: number; count: number }
 
 /** One `messages.getDialogs` request. `next` is an opaque offset for the following page, absent on the last one. */
 export interface TelegramDialogPage { chats: TelegramChatRecord[]; next?: unknown }
@@ -39,6 +50,12 @@ export interface TelegramClientAdapter {
   loginWithQr(callbacks: TelegramLoginCallbacks): Promise<void>;
   /** Exactly one Telegram request per call, so the platform can throttle every page. */
   getDialogs(offset?: unknown): Promise<TelegramDialogPage>;
+  /** `channels.getFullChannel`: true when this account may not see the supergroup's members (spec 4.5 step 1). */
+  isChannelHidden(ref: Extract<TelegramGroupRef, { kind: 'channel' }>): Promise<boolean>;
+  /** `messages.getFullChat`: every member of a basic group; `hidden` when Telegram withholds the list. */
+  getChatMembers(ref: Extract<TelegramGroupRef, { kind: 'chat' }>): Promise<{ members: TelegramMember[]; hidden: boolean }>;
+  /** `channels.getParticipants` (recent filter), up to 200 from `offset`. */
+  getChannelMembers(ref: Extract<TelegramGroupRef, { kind: 'channel' }>, offset: number): Promise<TelegramMemberPage>;
   logOut(): Promise<void>;
   destroy(): Promise<void>;
 }
@@ -59,6 +76,9 @@ export interface TelegramPlatformOptions {
 
 /** Safety cap on dialog pages (100 dialogs each), so a paging bug cannot loop forever. */
 const MAX_DIALOG_PAGES = 100;
+/** Telegram stops returning supergroup members at about 10k (spec 4.5); 60 pages of 200 leaves headroom. */
+const MAX_MEMBER_PAGES = 60;
+const isAdminRequired = (error: unknown) => (error as { errorMessage?: unknown } | null)?.errorMessage === 'CHAT_ADMIN_REQUIRED';
 
 /**
  * Pure filter (spec 4.4): basic groups and supergroups the user is still in, once each, in dialog order.
@@ -126,6 +146,8 @@ export class TelegramPlatform implements Platform {
   private readonly passwordTimeoutMs: number;
   private readonly logoutTimeoutMs: number;
   private readonly throttle: TelegramThrottle;
+  /** Filled by listGroups; export validation always lists groups right before listContacts. */
+  private groupRefs = new Map<string, TelegramGroupRef>();
 
   constructor(private readonly options: TelegramPlatformOptions) {
     this.throttle = options.throttle ?? new TelegramThrottle();
@@ -237,15 +259,62 @@ export class TelegramPlatform implements Platform {
         if (result.next === undefined) break;
         offset = result.next;
       }
-      return selectTelegramGroups(chats);
+      const groups = selectTelegramGroups(chats);
+      const kept = new Set(groups.map(group => group.id));
+      this.groupRefs = new Map(chats.flatMap(chat => (kept.has(chat.id) && chat.ref ? [[chat.id, chat.ref] as const] : [])));
+      return groups.filter(group => this.groupRefs.has(group.id));
     } catch (error) {
       console.error('Telegram listGroups failed', describeTelegramError(error));
       throw error;
     }
   }
 
-  async listContacts(_groupIds: readonly string[]): Promise<CategorizedContacts> {
-    throw new Error('Telegram contacts are not implemented yet (T18)');
+  /** docs/specs/06-telegram.md 4.5: hidden-member check for every group first, then members, one group at a time. */
+  async listContacts(groupIds: readonly string[]): Promise<CategorizedContacts> {
+    const client = this.client;
+    if (this.state !== 'connected' || !client) throw new Error('Telegram platform is not connected');
+    if (groupIds.some(id => !this.groupRefs.has(id))) await this.listGroups();
+    const refs = groupIds.map(id => {
+      const ref = this.groupRefs.get(id);
+      if (!ref) throw new Error('Unknown Telegram group');
+      return { id, ref };
+    });
+    try {
+      const hidden: string[] = [];
+      for (const { id, ref } of refs) {
+        if (ref.kind !== 'channel') continue;
+        try { if (await this.throttle.run(() => client.isChannelHidden(ref))) hidden.push(id); }
+        catch (error) { if (isAdminRequired(error)) hidden.push(id); else throw error; }
+      }
+      if (hidden.length) throw new PlatformError('members_hidden', hidden);
+      const members: TelegramMember[] = [];
+      for (const { id, ref } of refs) {
+        try {
+          if (ref.kind === 'chat') {
+            const result = await this.throttle.run(() => client.getChatMembers(ref));
+            if (result.hidden) throw new PlatformError('members_hidden', [id]);
+            members.push(...result.members);
+            continue;
+          }
+          let offset = 0;
+          for (let page = 0; page < MAX_MEMBER_PAGES; page++) {
+            const result = await this.throttle.run(() => client.getChannelMembers(ref, offset));
+            members.push(...result.members);
+            offset += result.returned;
+            if (result.returned === 0 || offset >= result.count) break;
+          }
+        } catch (error) {
+          if (isAdminRequired(error)) throw new PlatformError('members_hidden', [id]);
+          throw error;
+        }
+      }
+      return categorizeTelegramMembers(members);
+    } catch (error) {
+      if (!(error instanceof PlatformError && error.code === 'members_hidden')) {
+        console.error('Telegram listContacts failed', describeTelegramError(error));
+      }
+      throw error;
+    }
   }
 
   async disconnect() {
@@ -294,6 +363,17 @@ export function gramJsClientMaker(credentials: TelegramCredentials): TelegramCli
         });
       },
       async getDialogs(offset) { return readDialogPage(client, offset as DialogOffset | undefined); },
+      async isChannelHidden(ref) {
+        return isChannelHidden(await client.invoke(new Api.channels.GetFullChannel({ channel: inputChannel(ref) })));
+      },
+      async getChatMembers(ref) {
+        return readChatMembers(await client.invoke(new Api.messages.GetFullChat({ chatId: returnBigInt(ref.chatId) })));
+      },
+      async getChannelMembers(ref, offset) {
+        return readChannelMembers(await client.invoke(new Api.channels.GetParticipants({
+          channel: inputChannel(ref), filter: new Api.ChannelParticipantsRecent(), offset, limit: MEMBER_PAGE_SIZE, hash: returnBigInt(0),
+        })));
+      },
       async logOut() { await client.invoke(new Api.auth.LogOut()); },
       async destroy() { await client.destroy(); },
     };
@@ -306,11 +386,14 @@ interface DialogOffset { date: number; id: number; peer: Api.TypeEntityLike }
 function toChatRecord(chat: Api.TypeChat): TelegramChatRecord {
   if (chat instanceof Api.Chat) {
     return { kind: 'chat', id: getPeerId(chat), title: chat.title, left: chat.left, deactivated: chat.deactivated,
+      ref: { kind: 'chat', chatId: chat.id.toString() },
       // Absent optional fields arrive as `null` from Telegram (not `undefined`), so test for a real value.
       migrated: Boolean(chat.migratedTo) && !(chat.migratedTo instanceof Api.InputChannelEmpty) };
   }
   if (chat instanceof Api.Channel) {
-    return { kind: 'channel', id: getPeerId(chat), title: chat.title, left: chat.left, megagroup: chat.megagroup };
+    return { kind: 'channel', id: getPeerId(chat), title: chat.title, left: chat.left, megagroup: chat.megagroup,
+      // A `min` channel object can lack its access hash; without one it can't be queried, so it gets no ref.
+      ref: chat.accessHash ? { kind: 'channel', channelId: chat.id.toString(), accessHash: chat.accessHash.toString() } : undefined };
   }
   return { kind: 'unavailable', id: '', title: '' };
 }
@@ -355,4 +438,53 @@ export async function readDialogPage(client: Pick<TelegramClient, 'invoke'>, off
   const lastPeer = lastDialog ? entities.get(getPeerId(lastDialog.peer)) : undefined;
   if (!last || !lastPeer) return { chats }; // no safe offset: stop rather than loop
   return { chats, next: { date: last.date, id: last.id, peer: lastPeer } satisfies DialogOffset };
+}
+
+const MEMBER_PAGE_SIZE = 200;
+
+function inputChannel(ref: Extract<TelegramGroupRef, { kind: 'channel' }>) {
+  return new Api.InputChannel({ channelId: returnBigInt(ref.channelId), accessHash: returnBigInt(ref.accessHash) });
+}
+
+/** Copies only the fields the categorizer needs. Absent fields arrive as null; the categorizer accepts that. */
+export function toTelegramMember(user: Api.TypeUser): TelegramMember | undefined {
+  if (!(user instanceof Api.User)) return undefined;
+  return {
+    id: user.id.toString(), firstName: user.firstName, lastName: user.lastName, phone: user.phone, username: user.username,
+    usernames: user.usernames?.map(entry => ({ username: entry.username, active: entry.active })) ?? null,
+    contact: user.contact, self: user.self, deleted: user.deleted, bot: user.bot,
+  };
+}
+
+/** Members only: the users list of these responses also carries inviters and other referenced people. */
+function membersOf(users: readonly Api.TypeUser[], memberIds: ReadonlySet<string>) {
+  return users.flatMap(user => {
+    const member = memberIds.has(user.id.toString()) ? toTelegramMember(user) : undefined;
+    return member ? [member] : [];
+  });
+}
+
+/** Hidden when Telegram says this account can't view the list, or hides it from non-admins and we aren't one. */
+export function isChannelHidden(result: Api.messages.ChatFull): boolean {
+  const full = result.fullChat;
+  if (!(full instanceof Api.ChannelFull)) return true;
+  const channel = result.chats.find((chat): chat is Api.Channel => chat instanceof Api.Channel && chat.id.toString() === full.id.toString());
+  const admin = Boolean(channel?.creator || channel?.adminRights);
+  return !full.canViewParticipants || (Boolean(full.participantsHidden) && !admin);
+}
+
+export function readChatMembers(result: Api.messages.ChatFull): { members: TelegramMember[]; hidden: boolean } {
+  const full = result.fullChat;
+  if (!(full instanceof Api.ChatFull) || !(full.participants instanceof Api.ChatParticipants)) return { members: [], hidden: true };
+  const ids = new Set(full.participants.participants.map(participant => participant.userId.toString()));
+  return { members: membersOf(result.users, ids), hidden: false };
+}
+
+export function readChannelMembers(result: Api.channels.TypeChannelParticipants): TelegramMemberPage {
+  if (!(result instanceof Api.channels.ChannelParticipants)) return { members: [], returned: 0, count: 0 };
+  const ids = new Set(result.participants.flatMap(participant => {
+    if ('userId' in participant) return [participant.userId.toString()];
+    return participant.peer instanceof Api.PeerUser ? [participant.peer.userId.toString()] : [];
+  }));
+  return { members: membersOf(result.users, ids), returned: result.participants.length, count: result.count };
 }

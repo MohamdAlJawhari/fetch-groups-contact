@@ -1,6 +1,6 @@
 # Contact Export backend
 
-Requires Node.js 22.12+ and PostgreSQL. Authentication, admin user management, and the fake connection lifecycle are implemented. Telegram uses the real `TelegramPlatform` (GramJS) when `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` are set: QR login, two-step verification, logout (T16), and the group list (T17) work, while contacts come in T18. Without the keys, and for WhatsApp, `FakePlatform` is used. Export (`POST /connections/:id/export`) works against the fake platform.
+Requires Node.js 22.12+ and PostgreSQL. Authentication, admin user management, and the fake connection lifecycle are implemented. Telegram uses the real `TelegramPlatform` (GramJS) when `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` are set: QR login, two-step verification, logout (T16), the group list (T17), and member export (T18) work. Without the keys, and for WhatsApp, `FakePlatform` is used. Export (`POST /connections/:id/export`) works against the fake platform.
 
 From this folder, install dependencies with `npm ci`. Copy `.env.example` to `.env` if `.env` does not exist, then edit it:
 
@@ -166,6 +166,8 @@ The rules are in `docs/specs/06-telegram.md`. `TelegramPlatform` (`src/platforms
 - **Groups (T17):** `listGroups` pages through `messages.getDialogs` itself (100 dialogs per request, including archived chats) and keeps basic groups and supergroups the user is still in. Broadcast channels, private chats, migrated or deactivated groups, left groups, and forbidden chats are dropped. IDs are GramJS marked peer IDs (`-123…` basic, `-100…` supergroup), in dialog order. GramJS's own dialog iterator isn't used, because it pages without our throttle and prints message objects to the console on a parsing error.
 - **Throttle** (`telegram.throttle.ts`, one per connection): one request at a time, at least 1 s between starts. GramJS sleeps out a `FLOOD_WAIT` of 30 s or less. A longer one blocks every further request on that connection until it has passed, failing them at once (only `Telegram flood wait` and the seconds are logged).
 - `GET /connections/:id/groups` returns `502 could not read contacts from the platform; please try again` when the platform fails, and the connection is kept.
+- **Members (T18):** `listContacts` first runs `channels.getFullChannel` for every selected supergroup. If this account may not see the members (`canViewParticipants` is false, or `participantsHidden` is set and we aren't an admin, or `CHAT_ADMIN_REQUIRED`), the export returns `400 a selected group hides its member list` with `groupIds` (only the selected ones), before any member is fetched. It's audited as `export_failed`, and the connection is kept. Then each group is fetched one at a time through the throttle: basic groups with `messages.getFullChat` (one request), and supergroups with `channels.getParticipants` (recent filter, 200 per page, stopping on an empty page or the reported count, capped at about 12k). Only real participants are kept, because Telegram's `users` list also carries inviters.
+- **Categories** (`telegram.categorizer.ts`, pure): `saved` = in the account's Telegram contacts; `unsaved_reachable` = a visible phone (written `+digits`) or a username (falling back to the first active collectible username); `unsaved_unreachable` = neither. The account itself, deleted accounts, and bots are left out. Names are first + last, trimmed. Duplicates across groups are removed by `ExportService`.
 - `FakePlatform` accepts `password`/`passwordHint` options to simulate two-step verification in tests.
 
 To scan without the frontend, poll the status and draw each new `qr` in the terminal (`npx` downloads `qrcode-terminal` once):
@@ -185,11 +187,11 @@ Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)/pass
     -ContentType 'application/json' -Body (@{ password = (Read-Host 'Telegram 2FA password') } | ConvertTo-Json) -WebSession $appSession
 ```
 
-In the Telegram app: Settings → Devices → Link Desktop Device, then scan. Then `Invoke-RestMethod "http://localhost:3000/connections/$($connection.id)/groups" -WebSession $appSession` lists the groups. `/export` on real Telegram fails until T18.
+In the Telegram app: Settings → Devices → Link Desktop Device, then scan. Then `Invoke-RestMethod "http://localhost:3000/connections/$($connection.id)/groups" -WebSession $appSession` lists the groups. Then export as in "Export (step 5)" with the real group IDs.
 
 ## Tests
 
-`npm test` runs authentication, admin authorization, user management, email capitalization, connection ownership, concurrent replacement, cleanup, fake-clock reaper, Excel writer, export service, export endpoint (errors, audit, concurrency, aborted downloads), environment validation (Telegram keys), the Telegram login state machine with a scripted fake GramJS client (QR, 2FA, logout), the password endpoint, the Telegram group filter, dialog paging against real GramJS objects, the throttle (fake clock), and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
+`npm test` runs authentication, admin authorization, user management, email capitalization, connection ownership, concurrent replacement, cleanup, fake-clock reaper, Excel writer, export service, export endpoint (errors, audit, concurrency, aborted downloads), environment validation (Telegram keys), the Telegram login state machine with a scripted fake GramJS client (QR, 2FA, logout), the password endpoint, the Telegram group filter, dialog paging and member mapping against real GramJS objects, the throttle (fake clock), the Telegram categorizer, hidden-member detection, and HTTP tests without a database. To also exercise PostgreSQL repositories, audit persistence, concurrent email uniqueness, and the admin CLI, run in PowerShell:
 
 ```powershell
 $env:RUN_DATABASE_TESTS = '1'
