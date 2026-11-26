@@ -4,3 +4,5 @@ export class AppError extends Error {
 }
 
 export const LOGIN_FAILURE = 'wrong email or password';
+/** Sent only when the password was right (auth.service.ts), so it reveals nothing to someone guessing. */
+export const ACCOUNT_DISABLED = 'this account is disabled. Please contact your admin';

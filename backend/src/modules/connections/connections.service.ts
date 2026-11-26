@@ -4,6 +4,7 @@ import { exportFilename, zipEntryNames, type ExportFiles } from '../../export/ex
 import { ExportService } from '../../export/export.service.js';
 import { PlatformError } from '../../platforms/platform.errors.js';
 import type { PlatformFactory, PlatformName } from '../../platforms/platform.types.js';
+import type { AuditAction } from '../../shared/types.js';
 import type { AuditService } from '../audit/audit.service.js';
 import type { UserRepository } from '../users/users.repository.js';
 import type { SessionStore } from '../auth/session.store.js';
@@ -12,6 +13,13 @@ import { ConnectionRegistry, type ConnectionEntry } from './connection.registry.
 const PLATFORM_READ_FAILURE = 'could not read contacts from the platform; please try again';
 const PLATFORM_UNREACHABLE = 'could not reach the platform; please try again';
 const MAX_WRONG_PASSWORDS = 5;
+const PLATFORM_TITLES: Record<PlatformName, string> = { telegram: 'Telegram', whatsapp: 'WhatsApp' };
+
+interface ExportAudit { started: AuditAction; finished: AuditAction; failed: AuditAction }
+const GROUP_EXPORT: ExportAudit = { started: 'export_started', finished: 'export_finished', failed: 'export_failed' };
+const CONTACTS_EXPORT: ExportAudit = {
+  started: 'contacts_export_started', finished: 'contacts_export_finished', failed: 'contacts_export_failed',
+};
 
 /** A fetched export, ready to stream. `write` never rejects: failures cut the stream off and are audited. */
 export interface ExportJob {
@@ -106,43 +114,76 @@ export class ConnectionsService {
    * streaming do not, so status polls and DELETE stay responsive during a long export.
    */
   async export(ownerId: string, id: string, groupIds: readonly string[], files: ExportFiles = 'merged'): Promise<ExportJob> {
-    const { entry, titles } = await this.withOwner(ownerId, async () => {
+    let titles: string[] = [];
+    // Spec 4.6: "separate" only means something for two or more groups.
+    const separate = files === 'separate' && groupIds.length > 1;
+    return this.runJob(ownerId, id, { audit: GROUP_EXPORT, endOnSuccess: true, selectedIds: groupIds,
+      validate: async entry => {
+        let known: Map<string, string>;
+        try { known = new Map((await entry.platform.listGroups()).map(group => [group.id, group.title])); }
+        catch { throw new AppError(502, PLATFORM_READ_FAILURE); }
+        if (groupIds.some(groupId => !known.has(groupId))) throw new AppError(400, 'unknown group selected');
+        titles = groupIds.map(groupId => known.get(groupId)!);
+      },
+      prepare: async (entry, date) => {
+        const filename = exportFilename(titles, date, separate ? 'separate' : 'merged');
+        if (separate) {
+          const perGroup = await this.exporter.prepareEach(entry.platform, groupIds);
+          const names = zipEntryNames(titles, date);
+          return { kind: 'zip', filename,
+            write: out => this.exporter.writeZip(perGroup.map((contacts, index) => ({ name: names[index]!, contacts })), out) };
+        }
+        const contacts = await this.exporter.prepare(entry.platform, groupIds);
+        return { kind: 'xlsx', filename, write: out => this.exporter.write(contacts, out) };
+      },
+    });
+  }
+
+  /**
+   * docs/specs/09-phone-contacts.md: the same rules as the group export, except that the connection is **kept**
+   * after a successful download, so the user can still export groups (the user, 2026-11-26).
+   */
+  exportAddressBook(ownerId: string, id: string): Promise<ExportJob> {
+    return this.runJob(ownerId, id, { audit: CONTACTS_EXPORT, endOnSuccess: false, selectedIds: [],
+      validate: async () => {},
+      prepare: async (entry, date) => {
+        const book = await this.exporter.prepareAddressBook(entry.platform);
+        return { kind: 'xlsx', filename: `Phone contacts - ${PLATFORM_TITLES[entry.platformName]} - ${date}.xlsx`,
+          write: out => this.exporter.writeAddressBook(book, out) };
+      },
+    });
+  }
+
+  /** Spec 05, 4.4, shared by both exports: checks under the lock, then fetching and streaming outside it. */
+  private async runJob(ownerId: string, id: string, job: {
+    audit: ExportAudit; endOnSuccess: boolean; selectedIds: readonly string[];
+    validate(entry: ConnectionEntry): Promise<void>;
+    prepare(entry: ConnectionEntry, date: string): Promise<Pick<ExportJob, 'kind' | 'filename'> & { write(out: Writable): Promise<void> }>;
+  }): Promise<ExportJob> {
+    const entry = await this.withOwner(ownerId, async () => {
       const entry = this.owned(ownerId, id);
       if (entry.exporting) throw new AppError(409, 'an export is already running');
       if ((await entry.platform.getStatus()).status !== 'connected') {
         throw new AppError(409, 'connection is not connected yet');
       }
-      let known: Map<string, string>;
-      try { known = new Map((await entry.platform.listGroups()).map(group => [group.id, group.title])); }
-      catch { throw new AppError(502, PLATFORM_READ_FAILURE); }
-      if (groupIds.some(groupId => !known.has(groupId))) throw new AppError(400, 'unknown group selected');
-      await this.audit.record(ownerId, 'export_started', entry.platformName);
+      await job.validate(entry);
+      await this.audit.record(ownerId, job.audit.started, entry.platformName);
       entry.exporting = true;
-      return { entry, titles: groupIds.map(groupId => known.get(groupId)!) };
+      return entry;
     });
     const startedAt = new Date(this.now());
-    const date = startedAt.toISOString().slice(0, 10);
-    // Spec 4.6: "separate" only means something for two or more groups.
-    const separate = files === 'separate' && groupIds.length > 1;
-    let write: (out: Writable) => Promise<void>;
+    let prepared: Awaited<ReturnType<typeof job.prepare>>;
     try {
-      if (separate) {
-        const perGroup = await this.exporter.prepareEach(entry.platform, groupIds);
-        const names = zipEntryNames(titles, date);
-        write = out => this.exporter.writeZip(perGroup.map((contacts, index) => ({ name: names[index]!, contacts })), out);
-      } else {
-        const contacts = await this.exporter.prepare(entry.platform, groupIds);
-        write = out => this.exporter.write(contacts, out);
-      }
+      prepared = await job.prepare(entry, startedAt.toISOString().slice(0, 10));
     } catch (error) {
       throw await this.withOwner(ownerId, async () => {
         const live = this.isLive(entry);
         if (live) { entry.exporting = false; this.registry.touch(entry.id); }
-        await this.audit.record(ownerId, 'export_failed', entry.platformName);
+        await this.audit.record(ownerId, job.audit.failed, entry.platformName);
         if (!live) return new AppError(404, 'connection not found');
         if (error instanceof PlatformError && error.code === 'members_hidden') {
           // Only IDs the user selected, so nothing new leaks (spec 06, 3.4).
-          const hidden = (error.groupIds ?? []).filter(groupId => groupIds.includes(groupId));
+          const hidden = (error.groupIds ?? []).filter(groupId => job.selectedIds.includes(groupId));
           return new AppError(400, 'a selected group hides its member list', hidden);
         }
         return new AppError(502, PLATFORM_READ_FAILURE);
@@ -151,7 +192,7 @@ export class ConnectionsService {
     const state: StreamState = { aborted: false };
     await this.withOwner(ownerId, async () => {
       if (!this.isLive(entry)) {
-        await this.audit.record(ownerId, 'export_failed', entry.platformName);
+        await this.audit.record(ownerId, job.audit.failed, entry.platformName);
         throw new AppError(404, 'connection not found');
       }
       entry.abortExport = () => {
@@ -162,9 +203,9 @@ export class ConnectionsService {
     return {
       platform: entry.platformName,
       startedAt,
-      kind: separate ? 'zip' : 'xlsx',
-      filename: exportFilename(titles, date, separate ? 'separate' : 'merged'),
-      write: out => this.streamExport(entry, write, out, state),
+      kind: prepared.kind,
+      filename: prepared.filename,
+      write: out => this.streamExport(entry, prepared.write, out, state, job.audit, job.endOnSuccess),
     };
   }
 
@@ -205,7 +246,8 @@ export class ConnectionsService {
     return { id: entry.id, platform: entry.platformName, ...await entry.platform.getStatus() };
   }
   private isLive(entry: ConnectionEntry) { return this.registry.get(entry.id) === entry; }
-  private async streamExport(entry: ConnectionEntry, write: (out: Writable) => Promise<void>, out: Writable, state: StreamState) {
+  private async streamExport(entry: ConnectionEntry, write: (out: Writable) => Promise<void>, out: Writable, state: StreamState,
+    audit: ExportAudit, endOnSuccess: boolean) {
     state.out = out;
     let succeeded = false;
     try {
@@ -221,8 +263,15 @@ export class ConnectionsService {
       await this.withOwner(entry.ownerId, async () => {
         entry.abortExport = undefined;
         const live = this.isLive(entry);
-        await this.audit.record(entry.ownerId, succeeded ? 'export_finished' : 'export_failed', entry.platformName);
-        if (live) await this.end(entry);
+        await this.audit.record(entry.ownerId, succeeded ? audit.finished : audit.failed, entry.platformName);
+        if (!live) return;
+        if (succeeded && !endOnSuccess) {
+          // Phone contacts (spec 09): keep the link for a group export; the idle timer restarts now.
+          entry.exporting = false;
+          this.registry.touch(entry.id);
+        } else {
+          await this.end(entry);
+        }
       });
     } catch {
       console.error('Export cleanup failed');

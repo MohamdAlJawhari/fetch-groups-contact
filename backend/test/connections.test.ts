@@ -82,7 +82,8 @@ test('fake platforms provide placeholder QR, scan transition, groups, and contac
     await assert.rejects(platform.listGroups(), /not connected/);
     time += 3_000;
     assert.deepEqual(await platform.getStatus(), {status: 'connected'});
-    assert.equal((await platform.listGroups()).length, 2);
+    // Telegram's fake also has one channel the account manages (spec 06b).
+    assert.equal((await platform.listGroups()).length, name === 'telegram' ? 3 : 2);
     const categories = await platform.listContacts(['sample-group-1']);
     // Both platforms give 3 categories (docs/specs/08-whatsapp.md).
     assert.deepEqual(categories.map(item => item.category), ['saved', 'unsaved_reachable', 'unsaved_unreachable']);
@@ -107,7 +108,7 @@ test('connection endpoints return waiting QR, connected status and groups, then 
     assert.deepEqual(await status.json(), {id: started.id, platform: 'telegram', status: 'connected'});
     const groups = await f.request('GET', `/connections/${started.id}/groups`, cookie);
     assert.equal(groups.status, 200);
-    assert.equal((await groups.json() as {groups: unknown[]}).groups.length, 2);
+    assert.deepEqual((await groups.json() as {groups: Array<{kind?: string}>}).groups.map(group => group.kind ?? 'group'), ['group', 'group', 'channel']);
     assert.equal((await f.request('DELETE', `/connections/${started.id}`, cookie)).status, 204);
     assert.equal(f.connectionRegistry.get(started.id), undefined);
     assert.equal((await f.request('GET', `/connections/${started.id}`, cookie)).status, 404);
@@ -460,6 +461,66 @@ test('"separate" with several groups streams a zip with one workbook per group, 
     }
     assert.equal((await f.request('GET', `/connections/${id}`, cookie)).status, 404);
     assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_finished', 'connection_ended']);
+  } finally { await f.close(); }
+});
+
+test('a Telegram channel the account manages exports like a group (spec 06b)', async () => {
+  const f = await fixture();
+  try {
+    const {cookie, id} = await connected(f);
+    const response = await f.request('POST', `/connections/${id}/export`, cookie, {groupIds: ['sample-group-1', 'sample-channel-1']});
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('content-disposition')!, /2%20groups%20-%201970-01-01\.xlsx$/);
+    await new ExcelJS.Workbook().xlsx.load(await response.arrayBuffer());
+  } finally { await f.close(); }
+});
+
+for (const [platform, headers] of [['telegram', ['Name', 'Phone', 'Username']], ['whatsapp', ['Name', 'Phone']]] as const) {
+  test(`${platform} phone contacts export: one Contacts sheet, own audit actions, and the connection is kept`, async () => {
+    const f = await fixture();
+    try {
+      const {cookie, id} = await connected(f, platform);
+      const title = platform === 'telegram' ? 'Telegram' : 'WhatsApp';
+      const response = await f.request('POST', `/connections/${id}/export-contacts`, cookie, {});
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('content-type'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      assert.equal(response.headers.get('content-disposition'),
+        `attachment; filename="phone-contacts-${platform}-1970-01-01.xlsx"; filename*=UTF-8''Phone%20contacts%20-%20${title}%20-%201970-01-01.xlsx`);
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(await response.arrayBuffer());
+      assert.deepEqual(workbook.worksheets.map(sheet => sheet.name), ['Contacts']);
+      const sheet = workbook.getWorksheet('Contacts')!;
+      assert.deepEqual((sheet.getRow(1).values as unknown[]).slice(1), headers);
+      assert.deepEqual([sheet.getRow(2).getCell(1).value, sheet.getRow(3).getCell(1).value], ['Sample contact A', 'Sample contact B']);
+      // Kept (the user, 2026-11-26): still connected, not exporting, and a group export still works.
+      await waitFor(() => f.connectionRegistry.get(id)?.exporting === false);
+      assert.equal((await (await f.request('GET', `/connections/${id}`, cookie)).json() as {status: string}).status, 'connected');
+      const groupsExport = await f.request('POST', `/connections/${id}/export`, cookie, groups);
+      assert.equal(groupsExport.status, 200);
+      await groupsExport.arrayBuffer();
+      assert.deepEqual(f.events.filter(event => event.action !== 'login').map(event => event.action), [
+        'connection_started', 'contacts_export_started', 'contacts_export_finished', 'export_started', 'export_finished', 'connection_ended',
+      ]);
+      assert.ok(f.events.every(event => event.action === 'login' || (event.platform === platform && event.targetUserId === undefined)));
+    } finally { await f.close(); }
+  });
+}
+
+test('phone contacts export: no body allowed, 409 before the scan, 404 for another user', async () => {
+  const f = await fixture();
+  try {
+    const cookie = await f.login(f.a);
+    const connection = await f.start(cookie, 'telegram');
+    const early = await f.request('POST', `/connections/${connection.id}/export-contacts`, cookie);
+    assert.equal(early.status, 409);
+    assert.deepEqual(await early.json(), {message: 'connection is not connected yet'});
+    f.advance(3_000);
+    const bad = await f.request('POST', `/connections/${connection.id}/export-contacts`, cookie, {groupIds: ['sample-group-1']});
+    assert.equal(bad.status, 400);
+    assert.deepEqual(await bad.json(), {message: 'this request takes no body'});
+    const other = await f.request('POST', `/connections/${connection.id}/export-contacts`, await f.login(f.b), {});
+    assert.equal(other.status, 404);
+    assert.equal(f.events.some(event => event.action.startsWith('contacts_export')), false);
   } finally { await f.close(); }
 });
 

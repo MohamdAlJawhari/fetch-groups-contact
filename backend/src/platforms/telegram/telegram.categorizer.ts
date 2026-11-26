@@ -21,21 +21,33 @@ export interface TelegramMember {
 
 const text = (value: string | null | undefined) => (typeof value === 'string' ? value.trim() : '');
 
+/** The exported fields of one member; undefined for the account itself, deleted accounts, and bots. */
+function toContact(member: TelegramMember): Contact | undefined {
+  if (member.self || member.deleted || member.bot) return undefined;
+  const name = [text(member.firstName), text(member.lastName)].filter(Boolean).join(' ');
+  const digits = text(member.phone).replace(/^\+/, '');
+  const username = text(member.username) || text(member.usernames?.find(entry => entry.active)?.username);
+  const contact: Contact = { id: member.id, name };
+  if (digits) contact.phoneNumber = `+${digits}`;
+  if (username) contact.username = username;
+  return contact;
+}
+
+/** Pure (spec 09): the account's Telegram contacts, with the same fields as a group export. */
+export function toTelegramAddressBook(members: readonly TelegramMember[]): Contact[] {
+  return members.flatMap(member => { const contact = toContact(member); return contact ? [contact] : []; });
+}
+
 /** Pure: always returns the three Telegram categories, in order, even when empty. */
 export function categorizeTelegramMembers(members: readonly TelegramMember[]): CategorizedContacts {
   const saved: Contact[] = [];
   const reachable: Contact[] = [];
   const unreachable: Contact[] = [];
   for (const member of members) {
-    if (member.self || member.deleted || member.bot) continue;
-    const name = [text(member.firstName), text(member.lastName)].filter(Boolean).join(' ');
-    const digits = text(member.phone).replace(/^\+/, '');
-    const username = text(member.username) || text(member.usernames?.find(entry => entry.active)?.username);
-    const contact: Contact = { id: member.id, name };
-    if (digits) contact.phoneNumber = `+${digits}`;
-    if (username) contact.username = username;
+    const contact = toContact(member);
+    if (!contact) continue;
     if (member.contact) saved.push(contact);
-    else if (digits || username) reachable.push(contact);
+    else if (contact.phoneNumber || contact.username) reachable.push(contact);
     else unreachable.push(contact);
   }
   return [

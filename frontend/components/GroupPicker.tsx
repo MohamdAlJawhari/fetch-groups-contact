@@ -18,6 +18,11 @@ export function GroupPicker({ groups, selected, hidden, disabled, onChange }: {
     return needle ? groups.filter(group => group.title.toLocaleLowerCase().includes(needle)) : groups;
   }, [groups, query]);
   const full = selected.size >= MAX_GROUPS;
+  // Spec 06b: channels the account manages are a separate list under the groups (one shared selection).
+  const sections = useMemo(() => [
+    { title: strings.connect.groupsHeading, items: shown.filter(group => group.kind !== 'channel') },
+    { title: strings.connect.channelsHeading, items: shown.filter(group => group.kind === 'channel') },
+  ].filter((section, index) => index === 0 || groups.some(group => group.kind === 'channel')), [groups, shown]);
 
   function toggle(id: string) {
     const next = new Set(selected);
@@ -56,7 +61,14 @@ export function GroupPicker({ groups, selected, hidden, disabled, onChange }: {
           <p className="px-3 py-8 text-center text-stone-600">{groups.length ? strings.connect.noMatch : strings.connect.noGroups}</p>
         ) : (
           <ul className="max-h-[28rem] overflow-y-auto">
-            {shown.map(group => {
+            {sections.flatMap(section => [
+              ...(sections.length > 1 && section.items.length ? [
+                <li key={`heading-${section.title}`} role="presentation"
+                  className="sticky top-0 z-10 border-b border-stone-200 bg-stone-50 px-3 py-1.5 text-xs font-medium text-stone-600">
+                  {section.title}
+                </li>,
+              ] : []),
+              ...section.items.map(group => {
               const isHidden = hidden.has(group.id);
               const checked = selected.has(group.id);
               const tagId = `${searchId}-hidden-${group.id}`;
@@ -75,7 +87,8 @@ export function GroupPicker({ groups, selected, hidden, disabled, onChange }: {
                   </label>
                 </li>
               );
-            })}
+              }),
+            ])}
           </ul>
         )}
       </div>

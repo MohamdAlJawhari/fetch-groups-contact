@@ -17,14 +17,22 @@ export default function ChangePasswordPage() {
   const [next, setNext] = useState('');
   const [confirm, setConfirm] = useState('');
   const [mismatch, setMismatch] = useState(false);
+  const [nextError, setNextError] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [done, setDone] = useState(false);
+
+  const t = strings.changePassword;
 
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (busy || done) return;
     setError(undefined);
+    // The same rules as the server (10 characters, bcrypt's 72 bytes), shown under the field in plain words.
+    const problem = Array.from(next).length < 10 ? t.tooShort
+      : new TextEncoder().encode(next).length > 72 ? t.tooLong : undefined;
+    setNextError(problem);
+    if (problem) return;
     if (next !== confirm) { setMismatch(true); return; }
     setMismatch(false);
     setBusy(true);
@@ -42,7 +50,6 @@ export default function ChangePasswordPage() {
 
   if (!user) return <main className="mx-auto max-w-sm px-6 pt-16"><p role="status" className="text-stone-600">{strings.loading}</p></main>;
 
-  const t = strings.changePassword;
   return (
     <AuthCard title={t.title} intro={user.mustChangePassword ? t.intro : t.introVoluntary}>
       {done ? (
@@ -53,8 +60,8 @@ export default function ChangePasswordPage() {
           <input type="email" autoComplete="username" value={user.email} readOnly hidden />
           <Field id="current" label={t.current} type="password" autoComplete="current-password" required
             value={current} onChange={event => setCurrent(event.target.value)} disabled={busy} />
-          <Field id="new" label={t.next} type="password" autoComplete="new-password" required hint={t.hint}
-            value={next} onChange={event => setNext(event.target.value)} disabled={busy} />
+          <Field id="new" label={t.next} type="password" autoComplete="new-password" required hint={t.hint} error={nextError}
+            value={next} onChange={event => { setNext(event.target.value); setNextError(undefined); }} disabled={busy} />
           <Field id="confirm" label={t.confirm} type="password" autoComplete="new-password" required
             error={mismatch ? t.mismatch : undefined}
             value={confirm} onChange={event => { setConfirm(event.target.value); setMismatch(false); }} disabled={busy} />

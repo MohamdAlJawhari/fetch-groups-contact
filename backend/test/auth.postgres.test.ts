@@ -178,11 +178,27 @@ test('PostgreSQL: first-admin CLI, real repositories, password change, audit row
       assert.deepEqual(adminEvents.map(event => event.targetUserId), [
         target.id, racedUser.id, target.id, target.id, target.id,
       ]);
+      // T52: deleting keeps the row and its audit rows, frees the email, and the CHECK constraint holds.
+      const targetEmail = target.email;
+      const auditBefore = await db.auditLog.count({where: {OR: [{userId: target.id}, {targetUserId: target.id}]}});
+      assert.equal((await adminRequest('DELETE', `/${target.id}`)).status, 204);
+      const removed = await db.user.findUniqueOrThrow({where: {id: target.id}});
+      assert.equal(removed.isActive, false);
+      assert.ok(removed.deletedAt);
+      assert.equal(removed.deletedEmail, targetEmail);
+      assert.equal(removed.email, `deleted-${target.id}@deleted.invalid`);
+      assert.equal(await db.auditLog.count({where: {OR: [{userId: target.id}, {targetUserId: target.id}]}}), auditBefore + 1);
+      assert.equal((await adminRequest('DELETE', `/${target.id}`)).status, 404);
+      assert.equal((await adminRequest('POST', `/${target.id}/enable`)).status, 404);
+      await assert.rejects(db.user.update({where: {id: target.id}, data: {isActive: true}}), 'the CHECK keeps deleted accounts inactive');
+      assert.equal((await post('login', {email: targetEmail, password: resetBody.temporaryPassword})).status, 401);
+      assert.equal(((await (await adminRequest('GET', '')).json()) as {users: Array<{id: string}>}).users.some(user => user.id === target.id), false);
+      assert.equal((await adminRequest('POST', '', {email: targetEmail})).status, 201);
       await db.user.update({where: {id: stored.id}, data: {isActive: false}});
       assert.equal((await post('logout', {}, third.headers.get('set-cookie')!.split(';')[0])).status, 401);
       const disabled = await post('login', {email: stored.email, password: replacement});
-      assert.equal(disabled.status, 401);
-      assert.deepEqual(await disabled.json(), {message: 'wrong email or password'});
+      assert.equal(disabled.status, 403);
+      assert.deepEqual(await disabled.json(), {message: 'this account is disabled. Please contact your admin'});
     } finally {
       if (server) await new Promise<void>(resolve => server!.close(() => resolve()));
       await db?.$disconnect();

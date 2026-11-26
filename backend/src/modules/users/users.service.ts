@@ -41,7 +41,7 @@ export class UsersService {
   }
 
   async resetPassword(actorId: string, userId: string) {
-    if (!(await this.users.findById(userId))) throw new AppError(404, 'user not found');
+    await this.liveUser(userId);
     const temporaryPassword = randomBytes(24).toString('base64url');
     const user = await this.users.resetPassword(userId, await this.hasher.hash(temporaryPassword));
     this.sessions.removeForUser(userId);
@@ -52,6 +52,7 @@ export class UsersService {
 
   async setActive(actorId: string, userId: string, isActive: boolean) {
     if (!isActive && actorId === userId) throw new AppError(400, 'you cannot disable your own account');
+    await this.liveUser(userId); // a deleted account can't be enabled again
     const user = await this.users.setActive(userId, isActive);
     if (!isActive) {
       this.sessions.removeForUser(userId);
@@ -59,5 +60,23 @@ export class UsersService {
     }
     await this.audit.record(actorId, isActive ? 'admin_user_enabled' : 'admin_user_disabled', undefined, userId);
     return publicAdminUser(user);
+  }
+
+  /**
+   * T52 (the user's decision, 2026-11-26): the account leaves the list, can never log in again, and its email is
+   * free for a new account. The row and its audit history stay; the old email is kept in `deleted_email`.
+   */
+  async remove(actorId: string, userId: string) {
+    if (actorId === userId) throw new AppError(400, 'you cannot delete your own account');
+    await this.users.markDeleted(userId);
+    this.sessions.removeForUser(userId);
+    await this.connections.destroyForUser(userId);
+    await this.audit.record(actorId, 'admin_user_deleted', undefined, userId);
+  }
+
+  private async liveUser(userId: string) {
+    const user = await this.users.findById(userId);
+    if (!user || user.deletedAt) throw new AppError(404, 'user not found');
+    return user;
   }
 }

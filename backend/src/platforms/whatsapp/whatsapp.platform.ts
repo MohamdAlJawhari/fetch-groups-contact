@@ -3,7 +3,7 @@ import makeWASocket, {
   type AuthenticationState, type Contact as BaileysContact, type GroupMetadata, type SignalDataTypeMap, type SignalKeyStore,
 } from 'baileys';
 import { PlatformError } from '../platform.errors.js';
-import type { CategorizedContacts, Group, Platform, PlatformStatus } from '../platform.types.js';
+import type { AddressBook, CategorizedContacts, Contact, Group, Platform, PlatformStatus } from '../platform.types.js';
 import { categorizeWhatsAppMembers, type WhatsAppMember } from './whatsapp.categorizer.js';
 
 // ---------- The slice of Baileys the platform uses (docs/specs/08-whatsapp.md 4.2), so it can be tested offline ----------
@@ -91,7 +91,35 @@ export class WhatsAppContactBook {
     for (const record of found) mergeInto(merged, record);
     return merged;
   }
+  /** Every distinct record with a name saved in the phone (push names alone don't count). */
+  saved(): WhatsAppContactRecord[] {
+    return [...new Set(this.byJid.values())].filter(record => Boolean(record.name?.trim()));
+  }
   clear() { this.byJid.clear(); }
+}
+
+/**
+ * Spec 09: the saved contacts as export rows. Only person IDs (phone or LID), never the linked account.
+ * A contact WhatsApp knows only by a hidden ID (LID) with no known phone stays as a name-only row, as in the
+ * group export (the user, 2026-11-26).
+ */
+export async function whatsAppAddressBook(
+  records: readonly WhatsAppContactRecord[], selfIds: readonly string[], phoneForLid: (lid: string) => Promise<string | undefined>,
+): Promise<Contact[]> {
+  const self = new Set(selfIds);
+  const contacts: Contact[] = [];
+  for (const record of records) {
+    const lid = [record.id, record.lid].find(isLid);
+    let pn = [record.id, record.phoneNumber].find(isPn);
+    if (!pn && !lid) continue; // not a person (e.g. a group or broadcast ID)
+    if (!pn && lid) { const mapped = await phoneForLid(lid); if (isPn(mapped)) pn = mapped; }
+    if ([record.id, lid, pn].some(id => id && self.has(id))) continue;
+    const digits = pnDigits(pn);
+    const contact: Contact = { id: digits ? `pn:${digits}` : `lid:${lid}`, name: record.name?.trim() ?? '' };
+    if (digits) contact.phoneNumber = `+${digits}`;
+    contacts.push(contact);
+  }
+  return contacts;
 }
 function mergeInto(target: WhatsAppContactRecord, source: WhatsAppContactRecord) {
   for (const field of ['lid', 'phoneNumber', 'name', 'notify', 'username'] as const) {
@@ -246,8 +274,8 @@ export class WhatsAppPlatform implements Platform {
     return selectWhatsAppGroups(await this.fetchGroups(this.connectedSocket()));
   }
 
-  async listContacts(groupIds: readonly string[]): Promise<CategorizedContacts> {
-    const socket = this.connectedSocket();
+  /** Waits (up to 60 s) for the saved-contacts sync; both exports need the saved names. */
+  private async contactsReady() {
     const sync = this.ensureContactsSync();
     try {
       await withTimeout(sync, this.options.contactsWaitMs ?? 60_000);
@@ -256,6 +284,18 @@ export class WhatsAppPlatform implements Platform {
       if (this.contactsSync === sync) this.contactsSync = undefined;
       throw error instanceof PlatformError ? error : new PlatformError('unavailable');
     }
+  }
+
+  /** Spec 09: no new WhatsApp request; it reads the contacts the sync already brought. */
+  async listAddressBook(): Promise<AddressBook> {
+    const socket = this.connectedSocket();
+    await this.contactsReady();
+    return { contacts: await whatsAppAddressBook(this.contacts.saved(), socket.selfIds(), lid => socket.phoneForLid(lid)), usernames: false };
+  }
+
+  async listContacts(groupIds: readonly string[]): Promise<CategorizedContacts> {
+    const socket = this.connectedSocket();
+    await this.contactsReady();
     const cached = this.groupCache && this.now() - this.groupCache.at <= GROUP_CACHE_MS ? this.groupCache.groups : undefined;
     const groups = new Map((cached ?? await this.fetchGroups(socket)).map(group => [group.id, group]));
     const participants = groupIds.flatMap(id => {

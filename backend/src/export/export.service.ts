@@ -5,6 +5,8 @@ import { ZipWriter, type ExportFile } from './zip.writer.js';
 
 const collator = new Intl.Collator(undefined, { sensitivity: 'base' });
 
+export interface PreparedAddressBook { contacts: CategorizedContacts; usernames: boolean }
+
 function compareText(a: string | undefined, b: string | undefined) {
   const left = a?.trim() ?? '';
   const right = b?.trim() ?? '';
@@ -38,6 +40,18 @@ export class ExportService {
 
   writeZip(files: readonly ExportFile[], stream: Writable): Promise<void> {
     return this.zipWriter.write(files, stream);
+  }
+
+  /** Spec 09: the account's saved contacts as one `address_book` sheet, deduplicated and sorted like groups. */
+  async prepareAddressBook(platform: Platform): Promise<PreparedAddressBook> {
+    const book = await platform.listAddressBook();
+    const seen = new Set<string>();
+    const contacts = book.contacts.filter(contact => !seen.has(contact.id) && Boolean(seen.add(contact.id))).sort(compareContacts);
+    return { contacts: [{ category: 'address_book', contacts }], usernames: book.usernames };
+  }
+
+  writeAddressBook(book: PreparedAddressBook, stream: Writable): Promise<void> {
+    return this.writer.write(book.contacts, stream, { usernames: book.usernames });
   }
 
   /** Fetches the selected groups' members, deduplicated by contact id across categories and sorted by name. */

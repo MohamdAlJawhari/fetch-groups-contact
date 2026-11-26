@@ -14,5 +14,6 @@ export function createUsersRoutes(controller: UsersController, authenticate: Req
   router.post('/:id/reset-password', controller.resetPassword);
   router.post('/:id/enable', controller.setActive(true));
   router.post('/:id/disable', controller.setActive(false));
+  router.delete('/:id', controller.remove);
   return router;
 }

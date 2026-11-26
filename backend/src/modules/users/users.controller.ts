@@ -28,4 +28,8 @@ export class UsersController {
   setActive = (isActive: boolean) => async (request: Request, response: Response) => {
     response.json({ user: await this.users.setActive(request.user!.id, this.userId(request), isActive) });
   };
+  remove = async (request: Request, response: Response) => {
+    await this.users.remove(request.user!.id, this.userId(request));
+    response.status(204).end();
+  };
 }

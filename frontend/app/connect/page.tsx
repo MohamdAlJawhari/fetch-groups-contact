@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { AppShell } from '@/components/AppShell';
 import { Button } from '@/components/Button';
 import { Callout } from '@/components/Callout';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { Field } from '@/components/Field';
 import { GroupPicker } from '@/components/GroupPicker';
 import { PlatformCard } from '@/components/PlatformCard';
@@ -40,6 +41,9 @@ function ConnectFlow() {
   const [hidden, setHidden] = useState<Set<string>>(() => new Set());
   const [exporting, setExporting] = useState(false);
   const [files, setFiles] = useState<ExportFiles>('merged');
+  const [confirmContacts, setConfirmContacts] = useState(false);
+  const [exportingContacts, setExportingContacts] = useState(false);
+  const busy = exporting || exportingContacts;
 
   function track(view: ConnectionView | undefined) {
     liveId.current = view?.id;
@@ -53,6 +57,7 @@ function ConnectFlow() {
     setSelected(new Set());
     setHidden(new Set());
     setFiles('merged');
+    setConfirmContacts(false);
     setPassword('');
     setPasswordError(undefined);
     setNotice(next);
@@ -158,8 +163,27 @@ function ConnectFlow() {
     }
   }
 
+  /** Spec 09: its own file; the server keeps the connection, so groups can still be exported afterwards. */
+  async function exportContacts() {
+    setConfirmContacts(false);
+    if (!connection || busy) return;
+    setExportingContacts(true);
+    setNotice(undefined);
+    try {
+      await apiDownload(`/connections/${connection.id}/export-contacts`, {}, `phone-contacts-${connection.platform}.xlsx`);
+      setNotice({ tone: 'info', text: c.contactsDone });
+    } catch (caught) {
+      const error = caught instanceof ApiError ? caught : undefined;
+      if (error?.status === 404) reset({ tone: 'error', text: c.connectionEnded });
+      else if (error?.status === 0 && error.message === c.downloadFailed) reset({ tone: 'error', text: c.downloadFailed });
+      else setNotice({ tone: 'error', text: messageOf(caught) }); // 502 etc.: the connection is kept, try again
+    } finally {
+      setExportingContacts(false);
+    }
+  }
+
   async function exportFile() {
-    if (!connection || exporting || selected.size === 0) return;
+    if (!connection || busy || selected.size === 0) return;
     setExporting(true);
     setNotice(undefined);
     // Spec 05, 4.6: the server names the file; "separate" only matters for two or more groups.
@@ -251,12 +275,25 @@ function ConnectFlow() {
           {noticeBox}
           {groups ? (
             <>
-              <GroupPicker groups={groups} selected={selected} hidden={hidden} disabled={exporting} onChange={setSelected} />
-              {selected.size > 1 && <FilesChoice value={files} count={selected.size} disabled={exporting} onChange={setFiles} />}
-              <div className="flex flex-wrap gap-2">
-                <Button variant="primary" busy={exporting} busyLabel={c.exporting} disabled={selected.size === 0} onClick={() => void exportFile()}>{c.export}</Button>
-                <Button onClick={() => void disconnect()} busy={cancelling} disabled={exporting}>{c.disconnect}</Button>
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-3 rounded-lg border border-stone-200 px-4 py-3">
+                <div className="flex min-w-60 flex-1 flex-col gap-0.5">
+                  <span className="font-medium">{c.contactsTitle}</span>
+                  <span className="text-xs text-stone-600">{c.contactsIntro}</span>
+                </div>
+                <Button busy={exportingContacts} busyLabel={c.contactsExporting} disabled={exporting}
+                  onClick={() => setConfirmContacts(true)}>{c.contactsExport}</Button>
               </div>
+              <GroupPicker groups={groups} selected={selected} hidden={hidden} disabled={busy} onChange={setSelected} />
+              {/* Measured 2026-11-26: a 481-subscriber channel gave 201 rows (spec 06b, 3). */}
+              {groups.some(group => group.kind === 'channel') && <Callout tone="warning" size="sm">{c.channelLimit}</Callout>}
+              {selected.size > 1 && <FilesChoice value={files} count={selected.size} disabled={busy} onChange={setFiles} />}
+              <div className="flex flex-wrap gap-2">
+                <Button variant="primary" busy={exporting} busyLabel={c.exporting} disabled={selected.size === 0 || exportingContacts} onClick={() => void exportFile()}>{c.export}</Button>
+                <Button onClick={() => void disconnect()} busy={cancelling} disabled={busy}>{c.disconnect}</Button>
+              </div>
+              <ConfirmDialog open={confirmContacts} title={c.contactsConfirmTitle} body={c.contactsConfirmBody}
+                confirmLabel={c.contactsExport} confirmVariant="primary"
+                onConfirm={() => void exportContacts()} onCancel={() => setConfirmContacts(false)} />
             </>
           ) : (
             !notice && <p role="status" className="text-stone-600">{c.groupsLoading}</p>

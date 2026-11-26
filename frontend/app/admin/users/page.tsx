@@ -16,12 +16,12 @@ export default function AdminUsersPage() {
   return <AppShell>{user => <AdminUsers me={user} />}</AppShell>;
 }
 
-type Pending = { kind: 'reset' | 'disable'; user: AdminUser };
+type Pending = { kind: 'reset' | 'disable' | 'delete'; user: AdminUser };
 const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 const formatDate = (value: string | null) => (value ? dateFormat.format(new Date(value)) : strings.admin.never);
 const t = strings.admin;
 
-/** M3–M7: list, create (temporary password shown once), reset, disable, enable. */
+/** M3–M7: list, create (temporary password shown once), reset, disable, enable; T52: delete (history is kept). */
 function AdminUsers({ me }: { me: SessionUser }) {
   const [users, setUsers] = useState<AdminUser[]>();
   const [forbidden, setForbidden] = useState(me.role !== 'admin');
@@ -62,10 +62,14 @@ function AdminUsers({ me }: { me: SessionUser }) {
     }
   }
 
-  async function run(kind: 'reset' | 'disable' | 'enable', user: AdminUser) {
+  async function run(kind: 'reset' | 'disable' | 'enable' | 'delete', user: AdminUser) {
     setActing(user.id); setMessage(undefined);
     try {
-      if (kind === 'reset') {
+      if (kind === 'delete') {
+        await api(`/admin/users/${user.id}`, { method: 'DELETE' });
+        setUsers(list => list?.filter(entry => entry.id !== user.id));
+        setMessage({ tone: 'success', text: t.deletedDone(user.email) });
+      } else if (kind === 'reset') {
         const result = await api<UserWithTemporaryPassword>(`/admin/users/${user.id}/reset-password`, { method: 'POST' });
         replace(result.user);
         setTemporary({ email: result.user.email, password: result.temporaryPassword });
@@ -136,6 +140,7 @@ function AdminUsers({ me }: { me: SessionUser }) {
                         {user.isActive
                           ? !isMe && <Button size="sm" variant="danger-quiet" disabled={!!acting} onClick={() => setPending({ kind: 'disable', user })}>{t.disable}</Button>
                           : <Button size="sm" disabled={!!acting} busy={acting === user.id} onClick={() => run('enable', user)}>{t.enable}</Button>}
+                        {!isMe && <Button size="sm" variant="danger-quiet" disabled={!!acting} onClick={() => setPending({ kind: 'delete', user })}>{t.delete}</Button>}
                       </div>
                     </td>
                   </tr>
@@ -148,10 +153,11 @@ function AdminUsers({ me }: { me: SessionUser }) {
 
       <ConfirmDialog
         open={!!pending}
-        title={pending ? (pending.kind === 'reset' ? t.confirmReset(pending.user.email) : t.confirmDisable(pending.user.email)) : ''}
-        body={pending?.kind === 'disable' ? t.confirmDisableBody : t.confirmResetBody}
-        confirmLabel={pending?.kind === 'disable' ? t.disable : t.resetPassword}
-        confirmVariant={pending?.kind === 'disable' ? 'danger' : 'primary'}
+        title={!pending ? '' : pending.kind === 'reset' ? t.confirmReset(pending.user.email)
+          : pending.kind === 'delete' ? t.confirmDelete(pending.user.email) : t.confirmDisable(pending.user.email)}
+        body={pending?.kind === 'disable' ? t.confirmDisableBody : pending?.kind === 'delete' ? t.confirmDeleteBody : t.confirmResetBody}
+        confirmLabel={pending?.kind === 'disable' ? t.disable : pending?.kind === 'delete' ? t.delete : t.resetPassword}
+        confirmVariant={pending?.kind === 'reset' ? 'primary' : 'danger'}
         busy={!!pending && acting === pending.user.id}
         onCancel={() => setPending(undefined)}
         onConfirm={() => { if (pending) void run(pending.kind, pending.user); }}

@@ -5,6 +5,7 @@ import type { NextConfig } from 'next';
 const backend = (process.env.BACKEND_URL ?? 'http://localhost:3000').replace(/\/+$/, '');
 
 const nextConfig: NextConfig = {
+  allowedDevOrigins: ['*.loca.lt', '*.trycloudflare.com'],
   poweredByHeader: false,
   // This folder is the project root, so a stray package-lock.json further up (e.g. in the user folder) is never used.
   turbopack: { root: __dirname },

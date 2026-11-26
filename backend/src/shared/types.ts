@@ -13,12 +13,17 @@ export type AuditAction =
   | 'admin_user_created'
   | 'admin_password_reset'
   | 'admin_user_disabled'
+  | 'admin_user_deleted'
   | 'admin_user_enabled'
   | 'connection_started'
   | 'connection_ended'
   | 'export_started'
   | 'export_finished'
-  | 'export_failed';
+  | 'export_failed'
+  // Phone contacts export (docs/specs/09-phone-contacts.md).
+  | 'contacts_export_started'
+  | 'contacts_export_finished'
+  | 'contacts_export_failed';
 
 declare global {
   namespace Express {

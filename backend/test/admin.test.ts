@@ -50,9 +50,62 @@ function routes(id: string): Array<[string, string, unknown?]> {
   return [
     ['GET', '/admin/users'], ['POST', '/admin/users', {email: 'new@example.com'}],
     ['POST', `/admin/users/${id}/reset-password`], ['POST', `/admin/users/${id}/enable`],
-    ['POST', `/admin/users/${id}/disable`],
+    ['POST', `/admin/users/${id}/disable`], ['DELETE', `/admin/users/${id}`],
   ];
 }
+
+test('deleting a user (T52): gone from the list, can never log in, email free again, history kept', async () => {
+  const f = await fixture();
+  try {
+    const adminCookie = await f.login(f.admin);
+    const memberCookie = await f.login(f.member);
+    const memberEmail = f.member.email;
+    const deleted = await f.request('DELETE', `/admin/users/${f.member.id}`, undefined, adminCookie);
+    assert.equal(deleted.status, 204);
+    // Sessions end at once, and the account is blocked for good.
+    assert.equal((await f.request('POST', '/auth/logout', {}, memberCookie)).status, 401);
+    const login = await f.request('POST', '/auth/login', {email: memberEmail, password: initialPassword});
+    assert.equal(login.status, 401);
+    assert.deepEqual(await login.json(), {message: 'wrong email or password'}); // unknown, not "disabled"
+    const list = await (await f.request('GET', '/admin/users', undefined, adminCookie)).json() as {users: User[]};
+    assert.deepEqual(list.users.map(user => user.id), [f.admin.id]);
+    // The row stays (audit history points to it) with the old email kept aside.
+    const stored = f.users.records.get(f.member.id)!;
+    assert.equal(stored.isActive, false);
+    assert.equal(stored.deletedEmail, memberEmail);
+    assert.equal(stored.email, `deleted-${f.member.id}@deleted.invalid`);
+    assert.ok(f.records.some(record => record.userId === f.admin.id && record.action === 'admin_user_deleted' && record.targetUserId === f.member.id));
+    assert.ok(f.records.some(record => record.userId === f.member.id && record.action === 'login'), 'earlier history is kept');
+    // Every admin action on the deleted account is 404, and deleting again too.
+    for (const [method, path] of [['POST', `/admin/users/${f.member.id}/enable`], ['POST', `/admin/users/${f.member.id}/reset-password`],
+      ['POST', `/admin/users/${f.member.id}/disable`], ['DELETE', `/admin/users/${f.member.id}`]] as const) {
+      const response = await f.request(method, path, undefined, adminCookie);
+      assert.equal(response.status, 404, `${method} ${path}`);
+      assert.deepEqual(await response.json(), {message: 'user not found'});
+    }
+    assert.equal(stored.isActive, false);
+    // The same email can be used for a brand-new account.
+    const again = await f.request('POST', '/admin/users', {email: memberEmail}, adminCookie);
+    assert.equal(again.status, 201);
+    const created = await again.json() as {user: User; temporaryPassword: string};
+    assert.notEqual(created.user.id, f.member.id);
+    assert.equal((await f.request('POST', '/auth/login', {email: memberEmail, password: created.temporaryPassword})).status, 200);
+  } finally { await f.close(); }
+});
+
+test('an admin cannot delete their own account, and a bad or unknown id is rejected without audit', async () => {
+  const f = await fixture();
+  try {
+    const adminCookie = await f.login(f.admin);
+    const self = await f.request('DELETE', `/admin/users/${f.admin.id}`, undefined, adminCookie);
+    assert.equal(self.status, 400);
+    assert.deepEqual(await self.json(), {message: 'you cannot delete your own account'});
+    assert.equal((await f.request('DELETE', '/admin/users/not-a-uuid', undefined, adminCookie)).status, 400);
+    assert.equal((await f.request('DELETE', `/admin/users/${randomUUID()}`, undefined, adminCookie)).status, 404);
+    assert.equal(f.records.some(record => record.action === 'admin_user_deleted'), false);
+    assert.equal((await f.request('GET', '/auth/me', undefined, adminCookie)).status, 200);
+  } finally { await f.close(); }
+});
 
 function assertNoHash(value: unknown) { assert.doesNotMatch(JSON.stringify(value), /passwordHash|password_hash|\$2[aby]\$/); }
 
@@ -208,7 +261,7 @@ test('disable revokes all sessions, enable permits new login without restoring r
     assertNoHash(disabledResult);
     assert.equal(disabledResult.user.isActive, false);
     for (const cookie of [first, second]) assert.equal((await f.request('POST', '/auth/logout', {}, cookie)).status, 401);
-    assert.equal((await f.request('POST', '/auth/login', {email: f.member.email, password: initialPassword})).status, 401);
+    assert.equal((await f.request('POST', '/auth/login', {email: f.member.email, password: initialPassword})).status, 403); // disabled
     const enabled = await f.request('POST', `/admin/users/${f.member.id}/enable`, {}, adminCookie);
     assert.equal(enabled.status, 200);
     const enabledResult = await enabled.json() as {user: User};

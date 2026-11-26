@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { User } from '../../src/generated/prisma/client.js';
-import type { AdminUserRepository } from '../../src/modules/users/users.repository.js';
+import { deletedEmailPlaceholder, type AdminUserRepository } from '../../src/modules/users/users.repository.js';
 import { AppError } from '../../src/shared/errors.js';
 
 export class MemoryUserRepository implements AdminUserRepository {
@@ -17,11 +17,16 @@ export class MemoryUserRepository implements AdminUserRepository {
   async changePassword(id: string, passwordHash: string) {
     Object.assign(this.get(id), {passwordHash, mustChangePassword: false});
   }
-  async list() { return [...this.records.values()]; }
+  async list() { return [...this.records.values()].filter(user => !user.deletedAt); }
+  async markDeleted(id: string) {
+    const user = this.records.get(id);
+    if (!user || user.deletedAt) throw new AppError(404, 'user not found');
+    return Object.assign(user, {deletedAt: new Date(), deletedEmail: user.email, email: deletedEmailPlaceholder(id), isActive: false});
+  }
   async create(email: string, passwordHash: string) {
     if (await this.findByEmail(email)) throw new AppError(409, 'email already exists');
     const user: User = {id: randomUUID(), email, passwordHash, role: 'user', isActive: true,
-      mustChangePassword: true, createdAt: new Date(), lastLoginAt: null};
+      mustChangePassword: true, createdAt: new Date(), lastLoginAt: null, deletedAt: null, deletedEmail: null};
     this.records.set(user.id, user);
     return user;
   }

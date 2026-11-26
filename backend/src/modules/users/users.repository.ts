@@ -13,7 +13,12 @@ export interface AdminUserRepository extends UserRepository {
   create(email: string, passwordHash: string): Promise<User>;
   resetPassword(id: string, passwordHash: string): Promise<User>;
   setActive(id: string, isActive: boolean): Promise<User>;
+  /** T52: keeps the row (audit history) but frees the email and blocks the account for good. 404 if already gone. */
+  markDeleted(id: string): Promise<User>;
 }
+
+/** The placeholder email of a deleted account: unique per row, and `.invalid` can never be a real address. */
+export const deletedEmailPlaceholder = (id: string) => `deleted-${id}@deleted.invalid`;
 
 export class PrismaUserRepository implements AdminUserRepository {
   constructor(private readonly db: PrismaClient) {}
@@ -26,7 +31,18 @@ export class PrismaUserRepository implements AdminUserRepository {
     await this.db.user.update({ where: { id }, data: { passwordHash, mustChangePassword: false } });
   }
   list() {
-    return this.db.user.findMany({ orderBy: [{ createdAt: 'desc' }, { id: 'asc' }] });
+    return this.db.user.findMany({ where: { deletedAt: null }, orderBy: [{ createdAt: 'desc' }, { id: 'asc' }] });
+  }
+  async markDeleted(id: string) {
+    const user = await this.db.user.findUnique({ where: { id } });
+    if (!user || user.deletedAt) throw new AppError(404, 'user not found');
+    // `email` in the filter: a concurrent delete (or email change) makes this match nothing instead of overwriting.
+    const { count } = await this.db.user.updateMany({
+      where: { id, email: user.email, deletedAt: null },
+      data: { deletedAt: new Date(), deletedEmail: user.email, email: deletedEmailPlaceholder(id), isActive: false },
+    });
+    if (count !== 1) throw new AppError(404, 'user not found');
+    return (await this.db.user.findUnique({ where: { id } }))!;
   }
   async create(email: string, passwordHash: string) {
     try {

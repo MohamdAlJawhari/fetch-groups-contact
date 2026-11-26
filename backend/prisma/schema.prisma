@@ -16,6 +16,10 @@ model User {
   mustChangePassword Boolean    @default(true) @map("must_change_password")
   createdAt          DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
   lastLoginAt        DateTime?  @map("last_login_at") @db.Timestamptz(6)
+  /// Set when an admin deletes the account (T52). The row stays for the audit history.
+  deletedAt          DateTime?  @map("deleted_at") @db.Timestamptz(6)
+  /// The email the account had; `email` then holds a placeholder so the address can be used again.
+  deletedEmail       String?    @map("deleted_email") @db.VarChar(255)
   auditLogs          AuditLog[] @relation("AuditActor")
   targetedAuditLogs  AuditLog[] @relation("AuditTarget")
 

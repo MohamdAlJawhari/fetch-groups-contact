@@ -5,8 +5,8 @@ import { StringSession } from 'telegram/sessions/index.js';
 import { getPeerId } from 'telegram/Utils.js';
 import type { TelegramCredentials } from '../../config/env.schema.js';
 import { PlatformError } from '../platform.errors.js';
-import type { CategorizedContacts, Group, Platform, PlatformStatus } from '../platform.types.js';
-import { categorizeTelegramMembers, type TelegramMember } from './telegram.categorizer.js';
+import type { AddressBook, CategorizedContacts, Group, Platform, PlatformStatus } from '../platform.types.js';
+import { categorizeTelegramMembers, toTelegramAddressBook, type TelegramMember } from './telegram.categorizer.js';
 import { TelegramThrottle } from './telegram.throttle.js';
 
 /** The GramJS login callbacks the platform hands to the client (docs/specs/06-telegram.md 4.3). */
@@ -28,6 +28,10 @@ export interface TelegramChatRecord {
   deactivated?: boolean;
   migrated?: boolean;
   megagroup?: boolean;
+  /** A broadcast channel (not a supergroup). */
+  broadcast?: boolean;
+  /** The account created the channel or is one of its admins (spec 06b, 4.1). */
+  admin?: boolean;
   /** Telegram's `participantsCount`, when the dialog list carries it (often missing for supergroups). */
   memberCount?: number;
   /** What member requests need: the raw chat or channel ID, and the channel access hash. */
@@ -58,6 +62,8 @@ export interface TelegramClientAdapter {
   getChatMembers(ref: Extract<TelegramGroupRef, { kind: 'chat' }>): Promise<{ members: TelegramMember[]; hidden: boolean }>;
   /** `channels.getParticipants` (recent filter), up to 200 from `offset`. */
   getChannelMembers(ref: Extract<TelegramGroupRef, { kind: 'channel' }>, offset: number): Promise<TelegramMemberPage>;
+  /** `contacts.getContacts`: the account's Telegram contact list, in one request (spec 09). */
+  getContacts(): Promise<TelegramMember[]>;
   logOut(): Promise<void>;
   destroy(): Promise<void>;
 }
@@ -83,21 +89,26 @@ const MAX_MEMBER_PAGES = 60;
 const isAdminRequired = (error: unknown) => (error as { errorMessage?: unknown } | null)?.errorMessage === 'CHAT_ADMIN_REQUIRED';
 
 /**
- * Pure filter (spec 4.4): basic groups and supergroups the user is still in, once each, in dialog order.
- * Broadcast channels, migrated or deactivated groups, left groups, and forbidden chats are dropped.
+ * Pure filter (spec 4.4): basic groups and supergroups the user is still in, once each, in dialog order, plus
+ * broadcast channels the user owns or administers (spec 06b, marked `kind: 'channel'`). Subscriber-only channels,
+ * migrated or deactivated groups, left chats, and forbidden chats are dropped.
  */
 export function selectTelegramGroups(chats: readonly TelegramChatRecord[]): Group[] {
   const seen = new Set<string>();
   const groups: Group[] = [];
   for (const chat of chats) {
+    const managedChannel = chat.kind === 'channel' && chat.broadcast === true && chat.megagroup !== true
+      && chat.admin === true && !chat.left;
     const keep = chat.kind === 'chat' ? !chat.left && !chat.deactivated && !chat.migrated
-      : chat.kind === 'channel' ? chat.megagroup === true && !chat.left
+      : chat.kind === 'channel' ? (chat.megagroup === true && !chat.left) || managedChannel
       : false;
     if (!keep || seen.has(chat.id)) continue;
     seen.add(chat.id);
+    const group: Group = { id: chat.id, title: chat.title };
     const count = chat.memberCount;
-    groups.push(typeof count === 'number' && Number.isInteger(count) && count >= 0
-      ? { id: chat.id, title: chat.title, memberCount: count } : { id: chat.id, title: chat.title });
+    if (typeof count === 'number' && Number.isInteger(count) && count >= 0) group.memberCount = count;
+    if (managedChannel) group.kind = 'channel';
+    groups.push(group);
   }
   return groups;
 }
@@ -321,6 +332,18 @@ export class TelegramPlatform implements Platform {
     }
   }
 
+  /** Spec 09: one throttled `contacts.getContacts` request. */
+  async listAddressBook(): Promise<AddressBook> {
+    const client = this.client;
+    if (this.state !== 'connected' || !client) throw new Error('Telegram platform is not connected');
+    try {
+      return { contacts: toTelegramAddressBook(await this.throttle.run(() => client.getContacts())), usernames: true };
+    } catch (error) {
+      console.error('Telegram listAddressBook failed', describeTelegramError(error));
+      throw error;
+    }
+  }
+
   async disconnect() {
     const client = this.client;
     const wasLoggedIn = this.state === 'connected';
@@ -378,6 +401,11 @@ export function gramJsClientMaker(credentials: TelegramCredentials): TelegramCli
           channel: inputChannel(ref), filter: new Api.ChannelParticipantsRecent(), offset, limit: MEMBER_PAGE_SIZE, hash: returnBigInt(0),
         })));
       },
+      async getContacts() {
+        const result = await client.invoke(new Api.contacts.GetContacts({ hash: returnBigInt(0) }));
+        if (!(result instanceof Api.contacts.Contacts)) return [];
+        return result.users.flatMap(user => { const member = toTelegramMember(user); return member ? [member] : []; });
+      },
       async logOut() { await client.invoke(new Api.auth.LogOut()); },
       async destroy() { await client.destroy(); },
     };
@@ -396,7 +424,9 @@ function toChatRecord(chat: Api.TypeChat): TelegramChatRecord {
   }
   if (chat instanceof Api.Channel) {
     return { kind: 'channel', id: getPeerId(chat), title: chat.title, left: chat.left, megagroup: chat.megagroup,
-      memberCount: chat.participantsCount ?? undefined,
+      memberCount: chat.participantsCount ?? undefined, broadcast: chat.broadcast,
+      // Absent fields arrive as null: test for a real value (decisions.md, T17).
+      admin: Boolean(chat.creator) || Boolean(chat.adminRights),
       // A `min` channel object can lack its access hash; without one it can't be queried, so it gets no ref.
       ref: chat.accessHash ? { kind: 'channel', channelId: chat.id.toString(), accessHash: chat.accessHash.toString() } : undefined };
   }

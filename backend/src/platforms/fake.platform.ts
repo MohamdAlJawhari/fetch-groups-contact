@@ -1,5 +1,5 @@
 import { PlatformError } from './platform.errors.js';
-import type { CategorizedContacts, Platform, PlatformName, PlatformStatus } from './platform.types.js';
+import type { AddressBook, CategorizedContacts, Contact, Group, Platform, PlatformName, PlatformStatus } from './platform.types.js';
 
 export interface FakePlatformOptions {
   now?: () => number;
@@ -36,7 +36,18 @@ export class FakePlatform implements Platform {
   }
   async listGroups() {
     await this.requireConnected();
-    return [{ id: 'sample-group-1', title: 'Sample team', memberCount: 3 }, { id: 'sample-group-2', title: 'Sample community', memberCount: 3 }];
+    const groups: Group[] = [{ id: 'sample-group-1', title: 'Sample team', memberCount: 3 }, { id: 'sample-group-2', title: 'Sample community', memberCount: 3 }];
+    // Only Telegram has channels the account manages (spec 06b).
+    if (this.name === 'telegram') groups.push({ id: 'sample-channel-1', title: 'Sample channel', memberCount: 3, kind: 'channel' });
+    return groups;
+  }
+  async listAddressBook(): Promise<AddressBook> {
+    await this.requireConnected();
+    const contacts: Contact[] = [
+      { id: 'sample-book-2', name: 'Sample contact B', phoneNumber: '+12025550112' },
+      { id: 'sample-book-1', name: 'Sample contact A', phoneNumber: '+12025550111', ...(this.name === 'telegram' ? { username: 'sample_a' } : {}) },
+    ];
+    return { contacts, usernames: this.name === 'telegram' };
   }
   async listContacts(groupIds: readonly string[]): Promise<CategorizedContacts> {
     const groups = await this.listGroups();

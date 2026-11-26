@@ -1,5 +1,5 @@
 import type { ErrorRequestHandler } from 'express';
-import { AppError, LOGIN_FAILURE } from '../shared/errors.js';
+import { ACCOUNT_DISABLED, AppError, LOGIN_FAILURE } from '../shared/errors.js';
 import { randomUUID } from 'node:crypto';
 
 export const errorHandler: ErrorRequestHandler = (error, request, response, _next) => {
@@ -20,7 +20,9 @@ export const errorHandler: ErrorRequestHandler = (error, request, response, _nex
         ? code : undefined,
     });
   }
+  // Login answers vaguely, except the rate limit and the disabled message (sent only after the right password).
   const message = status === 429 && error instanceof AppError ? error.message
+    : error instanceof AppError && error.message === ACCOUNT_DISABLED ? error.message
     : request.path === '/auth/login' ? LOGIN_FAILURE
     : error instanceof AppError ? error.message
     : status === 400 ? 'invalid JSON' : status === 413 ? 'request too large' : 'internal server error';

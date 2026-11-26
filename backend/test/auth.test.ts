@@ -72,7 +72,7 @@ test('session IDs are random and expire at exactly eight hours', () => {
   assert.equal(sessions.get(first), undefined);
 });
 
-test('all credential failures use the identical message, including disabled users and malformed JSON', async () => {
+test('all credential failures use the identical message, a disabled user with the right password learns it, and malformed JSON', async () => {
   const f = await fixture();
   try {
     for (const body of [{email: 'missing@example.com', password}, {email: f.user.email, password: 'wrong'}, {}, {email: f.user.email, password: 'x'.repeat(73)}]) {
@@ -82,7 +82,14 @@ test('all credential failures use the identical message, including disabled user
       assert.equal(response.headers.get('set-cookie'), null);
     }
     f.user.isActive = false;
-    assert.deepEqual(await (await f.login()).json(), {message: 'wrong email or password'});
+    // A wrong password on a disabled account still gets the vague message; only the right one learns it's disabled.
+    const wrongOnDisabled = await f.post('/auth/login', {email: f.user.email, password: 'wrong'});
+    assert.equal(wrongOnDisabled.status, 401);
+    assert.deepEqual(await wrongOnDisabled.json(), {message: 'wrong email or password'});
+    const rightOnDisabled = await f.login();
+    assert.equal(rightOnDisabled.status, 403);
+    assert.deepEqual(await rightOnDisabled.json(), {message: 'this account is disabled. Please contact your admin'});
+    assert.equal(rightOnDisabled.headers.get('set-cookie'), null);
     const malformed = await fetch(f.base + '/auth/login', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{'});
     assert.equal(malformed.status, 400);
     assert.deepEqual(await malformed.json(), {message: 'wrong email or password'});
@@ -171,9 +178,9 @@ test('service enforces the 10-character boundary even when called without the co
     const session = f.sessions.create(f.user.id);
     const originalHash = f.user.passwordHash;
     for (const tooShort of ['123456789', '😀'.repeat(5)]) {
-      await assert.rejects(f.auth.changePassword(f.user.id, password, tooShort), /at least 10 characters/);
+      await assert.rejects(f.auth.changePassword(f.user.id, password, tooShort), /must be at least 10 characters long/);
     }
-    await assert.rejects(f.auth.changePassword(f.user.id, password, 'é'.repeat(37)), /at most 72 UTF-8 bytes/);
+    await assert.rejects(f.auth.changePassword(f.user.id, password, 'é'.repeat(37)), /too long\. Please use a shorter one/);
     assert.equal(f.user.passwordHash, originalHash);
     assert.equal(f.user.mustChangePassword, true);
     assert.ok(f.sessions.get(session));
@@ -195,8 +202,18 @@ test('temporary passwords are blocked from protected endpoints but can change pa
     const blocked = await fetch(f.base + '/protected', {headers: {Cookie: sessionCookie}});
     assert.equal(blocked.status, 403);
     assert.deepEqual(await blocked.json(), {message: 'password change required'});
-    const short = await f.post('/auth/change-password', {currentPassword: password, newPassword: '123456789'}, sessionCookie);
-    assert.equal(short.status, 400);
+    // Plain messages for non-technical users (2026-11-26), never field names or "UTF-8 bytes".
+    for (const [body, message] of [
+      [{currentPassword: password, newPassword: '123456789'}, 'the new password must be at least 10 characters long'],
+      [{currentPassword: password, newPassword: 'ع'.repeat(37)}, 'the new password is too long. Please use a shorter one'],
+      [{currentPassword: password}, 'please enter your current password and a new password'],
+      [{currentPassword: '', newPassword: '1234567890'}, 'please enter your current password and a new password'],
+      [{currentPassword: 'x'.repeat(73), newPassword: '1234567890'}, 'current password is incorrect'],
+    ] as const) {
+      const response = await f.post('/auth/change-password', body, sessionCookie);
+      assert.equal(response.status, 400, JSON.stringify(body));
+      assert.deepEqual(await response.json(), {message});
+    }
     const changed = await f.post('/auth/change-password', {currentPassword: password, newPassword: '1234567890'}, sessionCookie);
     assert.equal(changed.status, 200);
     assert.equal(f.user.mustChangePassword, false);

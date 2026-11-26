@@ -33,7 +33,7 @@ async function main() {
   if (!password.success) throw new Error(PASSWORD_REQUIREMENTS);
   const passwordHash = await new BcryptPasswordHasher().hash(password.data);
   await prisma.$transaction(async (tx) => {
-    if (await tx.user.count({ where: { role: 'admin' } })) {
+    if (await tx.user.count({ where: { role: 'admin', deletedAt: null } })) {
       throw new Error('An admin already exists. This command only creates the first admin.');
     }
     if (await tx.user.findUnique({ where: { email: email.data } })) {

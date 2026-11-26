@@ -8,7 +8,13 @@ const sheetNames: Record<ContactCategory, string> = {
   unsaved_reachable: 'Unsaved reachable',
   unsaved_unreachable: 'Unsaved unreachable',
   unsaved: 'Unsaved',
+  address_book: 'Contacts',
 };
+
+export interface ExcelWriteOptions {
+  /** Overrides the category rule for the Username column (spec 09: the platform decides for its address book). */
+  usernames?: boolean;
+}
 const usernameCategories: readonly ContactCategory[] = ['unsaved_reachable', 'unsaved_unreachable'];
 
 // Characters that are not allowed in XML 1.0 and would corrupt the .xlsx.
@@ -24,8 +30,8 @@ function text(value: string | undefined, prefix = ''): string | null {
  * Knows no platform names and never touches the disk. Sorting and deduplication are the caller's job.
  */
 export class ExcelWriter {
-  async write(contacts: CategorizedContacts, stream: Writable): Promise<void> {
-    const withUsername = contacts.some(group => usernameCategories.includes(group.category));
+  async write(contacts: CategorizedContacts, stream: Writable, options: ExcelWriteOptions = {}): Promise<void> {
+    const withUsername = options.usernames ?? contacts.some(group => usernameCategories.includes(group.category));
     const columns = [
       { header: 'Name', key: 'name', width: 32 },
       { header: 'Phone', key: 'phone', width: 18 },

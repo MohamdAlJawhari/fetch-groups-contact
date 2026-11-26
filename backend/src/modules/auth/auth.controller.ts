@@ -2,7 +2,7 @@ import type { CookieOptions, Request, Response } from 'express';
 import { AppError, LOGIN_FAILURE } from '../../shared/errors.js';
 import type { AuthService } from './auth.service.js';
 import { SESSION_COOKIE, SESSION_TTL_MS } from './session.store.js';
-import { changePasswordSchema, loginSchema, PASSWORD_REQUIREMENTS } from './auth.validation.js';
+import { changePasswordSchema, loginSchema, PASSWORDS_MISSING } from './auth.validation.js';
 
 export class AuthController {
   private readonly cookieOptions: CookieOptions;
@@ -29,9 +29,8 @@ export class AuthController {
   };
   changePassword = async (request: Request, response: Response) => {
     const parsed = changePasswordSchema.safeParse(request.body);
-    if (!parsed.success) {
-      throw new AppError(400, `provide currentPassword and newPassword. ${PASSWORD_REQUIREMENTS}`);
-    }
+    if (!parsed.success) throw new AppError(400, PASSWORDS_MISSING);
+    // Length rules are checked (with plain messages) in AuthService.changePassword.
     await this.auth.changePassword(request.user!.id, parsed.data.currentPassword, parsed.data.newPassword);
     response.clearCookie(SESSION_COOKIE, this.cookieOptions);
     response.json({ message: 'password changed; please log in again' });
