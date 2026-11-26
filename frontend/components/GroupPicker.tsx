@@ -68,6 +68,9 @@ export function GroupPicker({ groups, selected, hidden, disabled, onChange }: {
                       aria-describedby={isHidden ? tagId : undefined} />
                     {/* dir="auto" + plaintext bidi: Arabic titles read right-to-left, English left-to-right, in one list. */}
                     <span dir="auto" className={`flex-1 text-start text-base break-words [unicode-bidi:plaintext] ${isHidden ? 'text-stone-500' : ''}`}>{group.title}</span>
+                    {group.memberCount !== undefined && (
+                      <span className="shrink-0 text-xs text-stone-500 tabular-nums">{strings.connect.memberCount(group.memberCount)}</span>
+                    )}
                     {isHidden && <span id={tagId} className="shrink-0 rounded bg-stone-100 px-1.5 py-0.5 text-xs text-stone-600">{strings.connect.hiddenTag}</span>}
                   </label>
                 </li>

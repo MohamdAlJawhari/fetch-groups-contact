@@ -2,7 +2,8 @@ export type PlatformName = 'telegram' | 'whatsapp';
 export type ConnectionStatus = 'waiting-for-scan' | 'password-required' | 'connected' | 'disconnected';
 /** `qr` only while waiting for a scan; `passwordHint` only while a 2FA password is required (and one is set). */
 export interface PlatformStatus { status: ConnectionStatus; qr?: string; passwordHint?: string }
-export interface Group { id: string; title: string }
+/** `memberCount` only when the platform reports it without extra requests (it includes the account itself). */
+export interface Group { id: string; title: string; memberCount?: number }
 export interface Contact { id: string; name: string; phoneNumber?: string; username?: string }
 export type ContactCategory = 'saved' | 'unsaved_reachable' | 'unsaved_unreachable' | 'unsaved';
 export type CategorizedContacts = Array<{ category: ContactCategory; contacts: Contact[] }>;

@@ -11,7 +11,7 @@ import { QrPanel } from '@/components/QrPanel';
 import { StepIndicator } from '@/components/StepIndicator';
 import { api, apiDownload, ApiError, disconnectOnLeave } from '@/lib/api';
 import { sentence, strings } from '@/lib/strings';
-import type { ConnectionView, Group, PlatformName } from '@/lib/types';
+import type { ConnectionView, ExportFiles, Group, PlatformName } from '@/lib/types';
 
 export default function ConnectPage() {
   return <AppShell>{() => <ConnectFlow />}</AppShell>;
@@ -39,6 +39,7 @@ function ConnectFlow() {
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [hidden, setHidden] = useState<Set<string>>(() => new Set());
   const [exporting, setExporting] = useState(false);
+  const [files, setFiles] = useState<ExportFiles>('merged');
 
   function track(view: ConnectionView | undefined) {
     liveId.current = view?.id;
@@ -51,6 +52,7 @@ function ConnectFlow() {
     setGroups(undefined);
     setSelected(new Set());
     setHidden(new Set());
+    setFiles('merged');
     setPassword('');
     setPasswordError(undefined);
     setNotice(next);
@@ -160,8 +162,11 @@ function ConnectFlow() {
     if (!connection || exporting || selected.size === 0) return;
     setExporting(true);
     setNotice(undefined);
+    // Spec 05, 4.6: the server names the file; "separate" only matters for two or more groups.
+    const zip = files === 'separate' && selected.size > 1;
     try {
-      await apiDownload(`/connections/${connection.id}/export`, { groupIds: [...selected] }, `contacts-${connection.platform}.xlsx`);
+      await apiDownload(`/connections/${connection.id}/export`, { groupIds: [...selected], files },
+        `contacts-${connection.platform}.${zip ? 'zip' : 'xlsx'}`);
       track(undefined); // the server disconnected after the export
       setStep('done');
     } catch (caught) {
@@ -203,7 +208,7 @@ function ConnectFlow() {
             {(['telegram', 'whatsapp'] as const).map(platform => (
               <div key={platform} className="flex flex-col gap-3">
                 <PlatformCard platform={platform} busy={starting === platform} disabled={!!starting} onChoose={() => void start(platform)} />
-                {platform === 'whatsapp' && <Callout tone="info"><span className="text-stone-600">{c.whatsappNote}</span></Callout>}
+                {platform === 'whatsapp' && <Callout tone="warning" size="sm">{c.whatsappNote}</Callout>}
               </div>
             ))}
           </div>
@@ -247,6 +252,7 @@ function ConnectFlow() {
           {groups ? (
             <>
               <GroupPicker groups={groups} selected={selected} hidden={hidden} disabled={exporting} onChange={setSelected} />
+              {selected.size > 1 && <FilesChoice value={files} count={selected.size} disabled={exporting} onChange={setFiles} />}
               <div className="flex flex-wrap gap-2">
                 <Button variant="primary" busy={exporting} busyLabel={c.exporting} disabled={selected.size === 0} onClick={() => void exportFile()}>{c.export}</Button>
                 <Button onClick={() => void disconnect()} busy={cancelling} disabled={exporting}>{c.disconnect}</Button>
@@ -266,6 +272,34 @@ function ConnectFlow() {
         </section>
       )}
     </div>
+  );
+}
+
+/** Shown only when two or more groups are ticked: one merged workbook, or a zip of one workbook per group. */
+function FilesChoice({ value, count, disabled, onChange }: {
+  value: ExportFiles; count: number; disabled: boolean; onChange(next: ExportFiles): void;
+}) {
+  const options: Array<{ value: ExportFiles; label: string; hint: string }> = [
+    { value: 'merged', label: c.filesMerged, hint: c.filesMergedHint(count) },
+    { value: 'separate', label: c.filesSeparate, hint: c.filesSeparateHint },
+  ];
+  return (
+    <fieldset className="flex flex-col gap-2" disabled={disabled}>
+      <legend className="mb-2 text-sm font-medium">{c.filesLegend}</legend>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {options.map(option => (
+          <label key={option.value} className={`flex cursor-pointer gap-3 rounded-lg border px-3 py-2.5 ${value === option.value
+            ? 'border-stone-900 bg-stone-50' : 'border-stone-200 hover:bg-stone-50'} ${disabled ? 'cursor-not-allowed' : ''}`}>
+            <input type="radio" name="export-files" className="focus-ring mt-0.5 size-4 shrink-0 accent-stone-900"
+              checked={value === option.value} onChange={() => onChange(option.value)} />
+            <span className="flex flex-col gap-0.5 text-start">
+              <span className="font-medium">{option.label}</span>
+              <span className="text-xs text-stone-600">{option.hint}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+    </fieldset>
   );
 }
 

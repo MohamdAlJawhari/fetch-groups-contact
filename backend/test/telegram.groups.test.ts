@@ -189,7 +189,8 @@ test('readDialogPage maps chats, skips private chats, and builds the next offset
     ['chat', '-444', 'Old', true],
     ['chat', '-333', 'Basic', false],
   ]);
-  assert.deepEqual(selectTelegramGroups(first.chats), [{ id: '-100111', title: 'Supergroup' }, { id: '-333', title: 'Basic' }]);
+  // The supergroup has no participantsCount in the dialog list, so it gets no memberCount.
+  assert.deepEqual(selectTelegramGroups(first.chats), [{ id: '-100111', title: 'Supergroup' }, { id: '-333', title: 'Basic', memberCount: 3 }]);
   const next = first.next as { date: number; id: number; peer: unknown };
   assert.equal(next.date, 1_600);
   assert.equal(next.id, 50);
@@ -216,7 +217,7 @@ test('a basic group whose absent fields arrive as null (as Telegram sends them) 
   const page = new Api.messages.Dialogs({ dialogs: [dialog(new Api.PeerChat({ chatId: long(5452073554) }), 1)],
     messages: [], chats: [owned], users: [] });
   const { chats } = await readDialogPage({ invoke: async () => page } as never, undefined);
-  assert.deepEqual(selectTelegramGroups(chats), [{ id: '-5452073554', title: 'coworkers' }]);
+  assert.deepEqual(selectTelegramGroups(chats), [{ id: '-5452073554', title: 'coworkers', memberCount: 4 }]);
 });
 
 test('readDialogPage stops on a complete list or a short page', async () => {
@@ -240,6 +241,6 @@ test('chat records carry the IDs member requests need; a supergroup without an a
     undefined,
   ]);
   const { platform } = await connectedPlatform([{ chats }]);
-  assert.deepEqual(await platform.listGroups(), [{ id: '-100111', title: 'Supergroup' }, { id: '-333', title: 'Basic' }]);
+  assert.deepEqual(await platform.listGroups(), [{ id: '-100111', title: 'Supergroup' }, { id: '-333', title: 'Basic', memberCount: 3 }]);
   await platform.disconnect();
 });

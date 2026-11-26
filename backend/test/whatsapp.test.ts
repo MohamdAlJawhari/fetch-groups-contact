@@ -45,7 +45,7 @@ test('group selection drops community parents and sorts by title', () => {
     { id: 'x@g.us', subject: 'éclair', participants: [] },
   ];
   assert.deepEqual(selectWhatsAppGroups(groups), [
-    { id: 'a@g.us', title: 'Alpha' }, { id: 'b@g.us', title: 'beta' }, { id: 'x@g.us', title: 'éclair' },
+    { id: 'a@g.us', title: 'Alpha', memberCount: 0 }, { id: 'b@g.us', title: 'beta', memberCount: 0 }, { id: 'x@g.us', title: 'éclair', memberCount: 0 },
   ]);
 });
 
@@ -204,7 +204,7 @@ test('listGroups fetches once; listContacts reuses the 60 s cache, waits for the
     { id: 'p@g.us', subject: 'Parent', isCommunity: true, participants: [] },
   ];
   socket.events.contacts([{ id: '961111@s.whatsapp.net', name: 'Ali saved' }]);
-  assert.deepEqual(await s.platform.listGroups(), [{ id: 'a@g.us', title: 'Alpha' }]);
+  assert.deepEqual(await s.platform.listGroups(), [{ id: 'a@g.us', title: 'Alpha', memberCount: 3 }]);
   const result = await s.platform.listContacts(['a@g.us']);
   assert.deepEqual(socket.calls, ['sync', 'groups']);
   assert.deepEqual(result.map(entry => [entry.category, entry.contacts.map(contact => contact.id)]), [

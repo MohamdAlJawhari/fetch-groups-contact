@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import http from 'node:http';
 import type { Writable } from 'node:stream';
 import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
 import { test } from 'node:test';
 import { createApp } from '../src/app.js';
 import { AuthService } from '../src/modules/auth/auth.service.js';
@@ -398,7 +399,8 @@ for (const [platform, sheets] of [
       const response = await f.request('POST', `/connections/${id}/export`, cookie, groups);
       assert.equal(response.status, 200);
       assert.equal(response.headers.get('content-type'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      assert.equal(response.headers.get('content-disposition'), `attachment; filename="contacts-${platform}-1970-01-01.xlsx"`);
+      assert.equal(response.headers.get('content-disposition'),
+        `attachment; filename="contacts-${platform}-1970-01-01.xlsx"; filename*=UTF-8''2%20groups%20-%201970-01-01.xlsx`);
       assert.equal(response.headers.get('cache-control'), 'no-store');
       const workbook = new ExcelJS.Workbook();
       await workbook.xlsx.load(await response.arrayBuffer());
@@ -419,8 +421,57 @@ test('the filename uses the UTC date the export started', async () => {
     f.advance(Date.UTC(2026, 10, 20, 23, 59) - 3_000);
     const {cookie, id} = await connected(f);
     const response = await f.request('POST', `/connections/${id}/export`, cookie, groups);
-    assert.equal(response.headers.get('content-disposition'), 'attachment; filename="contacts-telegram-2026-11-20.xlsx"');
+    assert.equal(response.headers.get('content-disposition'),
+      `attachment; filename="contacts-telegram-2026-11-20.xlsx"; filename*=UTF-8''2%20groups%20-%202026-11-20.xlsx`);
     await response.arrayBuffer();
+  } finally { await f.close(); }
+});
+
+test('one selected group: the file is named after the group, also when "separate" is asked', async () => {
+  for (const files of [undefined, 'merged', 'separate'] as const) {
+    const f = await fixture();
+    try {
+      const {cookie, id} = await connected(f);
+      const response = await f.request('POST', `/connections/${id}/export`, cookie, {groupIds: ['sample-group-1'], ...(files ? {files} : {})});
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('content-type'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      assert.equal(response.headers.get('content-disposition'),
+        `attachment; filename="contacts-telegram-1970-01-01.xlsx"; filename*=UTF-8''Sample%20team%20-%201970-01-01.xlsx`);
+      await new ExcelJS.Workbook().xlsx.load(await response.arrayBuffer());
+    } finally { await f.close(); }
+  }
+});
+
+test('"separate" with several groups streams a zip with one workbook per group, then disconnects', async () => {
+  const f = await fixture();
+  try {
+    const {cookie, id} = await connected(f, 'whatsapp');
+    const response = await f.request('POST', `/connections/${id}/export`, cookie, {...groups, files: 'separate'});
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-type'), 'application/zip');
+    assert.equal(response.headers.get('content-disposition'),
+      `attachment; filename="contacts-whatsapp-1970-01-01.zip"; filename*=UTF-8''2%20groups%20-%201970-01-01.zip`);
+    const zip = await JSZip.loadAsync(await response.arrayBuffer());
+    assert.deepEqual(Object.keys(zip.files), ['Sample team - 1970-01-01.xlsx', 'Sample community - 1970-01-01.xlsx']);
+    for (const entry of Object.values(zip.files)) {
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(await entry.async('arraybuffer'));
+      assert.deepEqual(workbook.worksheets.map(sheet => sheet.name), ['Saved', 'Unsaved reachable', 'Unsaved unreachable']);
+    }
+    assert.equal((await f.request('GET', `/connections/${id}`, cookie)).status, 404);
+    assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_finished', 'connection_ended']);
+  } finally { await f.close(); }
+});
+
+test('export rejects an unknown files value', async () => {
+  const f = await fixture();
+  try {
+    const {cookie, id} = await connected(f);
+    for (const files of ['zip', '', 1, null]) {
+      const response = await f.request('POST', `/connections/${id}/export`, cookie, {...groups, files});
+      assert.equal(response.status, 400, JSON.stringify(files));
+      assert.deepEqual(await response.json(), {message: 'select between 1 and 50 groups'});
+    }
   } finally { await f.close(); }
 });
 

@@ -1,8 +1,9 @@
 import type { Writable } from 'node:stream';
 import { AppError } from '../../shared/errors.js';
+import { exportFilename, zipEntryNames, type ExportFiles } from '../../export/export.filename.js';
 import { ExportService } from '../../export/export.service.js';
 import { PlatformError } from '../../platforms/platform.errors.js';
-import type { CategorizedContacts, PlatformFactory, PlatformName } from '../../platforms/platform.types.js';
+import type { PlatformFactory, PlatformName } from '../../platforms/platform.types.js';
 import type { AuditService } from '../audit/audit.service.js';
 import type { UserRepository } from '../users/users.repository.js';
 import type { SessionStore } from '../auth/session.store.js';
@@ -16,6 +17,10 @@ const MAX_WRONG_PASSWORDS = 5;
 export interface ExportJob {
   platform: PlatformName;
   startedAt: Date;
+  /** `zip` for "separate files" with two or more groups (spec 05, 4.6). */
+  kind: 'xlsx' | 'zip';
+  /** The download name; it may contain a group title, so it's never logged or audited. */
+  filename: string;
   write(out: Writable): Promise<void>;
 }
 
@@ -100,25 +105,35 @@ export class ConnectionsService {
    * docs/specs/05-export.md section 4.4. Validation runs under the per-user lock; fetching and
    * streaming do not, so status polls and DELETE stay responsive during a long export.
    */
-  async export(ownerId: string, id: string, groupIds: readonly string[]): Promise<ExportJob> {
-    const entry = await this.withOwner(ownerId, async () => {
+  async export(ownerId: string, id: string, groupIds: readonly string[], files: ExportFiles = 'merged'): Promise<ExportJob> {
+    const { entry, titles } = await this.withOwner(ownerId, async () => {
       const entry = this.owned(ownerId, id);
       if (entry.exporting) throw new AppError(409, 'an export is already running');
       if ((await entry.platform.getStatus()).status !== 'connected') {
         throw new AppError(409, 'connection is not connected yet');
       }
-      let known: Set<string>;
-      try { known = new Set((await entry.platform.listGroups()).map(group => group.id)); }
+      let known: Map<string, string>;
+      try { known = new Map((await entry.platform.listGroups()).map(group => [group.id, group.title])); }
       catch { throw new AppError(502, PLATFORM_READ_FAILURE); }
       if (groupIds.some(groupId => !known.has(groupId))) throw new AppError(400, 'unknown group selected');
       await this.audit.record(ownerId, 'export_started', entry.platformName);
       entry.exporting = true;
-      return entry;
+      return { entry, titles: groupIds.map(groupId => known.get(groupId)!) };
     });
     const startedAt = new Date(this.now());
-    let contacts: CategorizedContacts;
+    const date = startedAt.toISOString().slice(0, 10);
+    // Spec 4.6: "separate" only means something for two or more groups.
+    const separate = files === 'separate' && groupIds.length > 1;
+    let write: (out: Writable) => Promise<void>;
     try {
-      contacts = await this.exporter.prepare(entry.platform, groupIds);
+      if (separate) {
+        const perGroup = await this.exporter.prepareEach(entry.platform, groupIds);
+        const names = zipEntryNames(titles, date);
+        write = out => this.exporter.writeZip(perGroup.map((contacts, index) => ({ name: names[index]!, contacts })), out);
+      } else {
+        const contacts = await this.exporter.prepare(entry.platform, groupIds);
+        write = out => this.exporter.write(contacts, out);
+      }
     } catch (error) {
       throw await this.withOwner(ownerId, async () => {
         const live = this.isLive(entry);
@@ -144,7 +159,13 @@ export class ConnectionsService {
         state.out?.destroy(new Error('Connection ended during export'));
       };
     });
-    return { platform: entry.platformName, startedAt, write: out => this.streamExport(entry, contacts, out, state) };
+    return {
+      platform: entry.platformName,
+      startedAt,
+      kind: separate ? 'zip' : 'xlsx',
+      filename: exportFilename(titles, date, separate ? 'separate' : 'merged'),
+      write: out => this.streamExport(entry, write, out, state),
+    };
   }
 
   disconnect(ownerId: string, id: string) {
@@ -184,12 +205,12 @@ export class ConnectionsService {
     return { id: entry.id, platform: entry.platformName, ...await entry.platform.getStatus() };
   }
   private isLive(entry: ConnectionEntry) { return this.registry.get(entry.id) === entry; }
-  private async streamExport(entry: ConnectionEntry, contacts: CategorizedContacts, out: Writable, state: StreamState) {
+  private async streamExport(entry: ConnectionEntry, write: (out: Writable) => Promise<void>, out: Writable, state: StreamState) {
     state.out = out;
     let succeeded = false;
     try {
       if (state.aborted) throw new Error('Connection ended during export');
-      await this.exporter.write(contacts, out);
+      await write(out);
       succeeded = true;
     } catch (error) {
       // Only the class name: platform and stream messages may carry contact data.

@@ -68,7 +68,7 @@ const collator = new Intl.Collator(undefined, { sensitivity: 'base' });
 /** Spec 4.4: community parent entries are not chats; the rest sorted by title. */
 export function selectWhatsAppGroups(groups: readonly WhatsAppGroupRecord[]): Group[] {
   return groups.filter(group => !group.isCommunity)
-    .map(group => ({ id: group.id, title: group.subject }))
+    .map(group => ({ id: group.id, title: group.subject, memberCount: group.participants.length }))
     .sort((a, b) => collator.compare(a.title.trim(), b.title.trim()));
 }
 

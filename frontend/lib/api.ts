@@ -87,11 +87,23 @@ export async function apiDownload(path: string, body: unknown, fallbackName: str
   }
 }
 
-/** `attachment; filename="contacts-telegram-2026-11-20.xlsx"` → the name, keeping only safe characters. */
+/** Characters a file name must not have: Windows-reserved, control, and bidi controls (they can fake an extension). */
+const UNSAFE_NAME = /[\u0000-\u001F\u007F"*/:<>?\\|‎‏‪-‮⁦-⁩]/g;
+
+/**
+ * The download name from `Content-Disposition` (spec 05, 4.6): the UTF-8 `filename*` (it may hold an Arabic group
+ * title) when present, else the ASCII `filename`. Unsafe characters are removed again, as a second line of defence.
+ */
 export function filenameFrom(header: string | null): string | undefined {
-  const match = header ? /filename="?([^";]+)"?/i.exec(header) : null;
-  const name = match?.[1]?.replace(/[^\w.\-]/g, '');
-  return name || undefined;
+  if (!header) return undefined;
+  let name: string | undefined;
+  const extended = /filename\*\s*=\s*UTF-8''([^;\s]+)/i.exec(header);
+  if (extended?.[1]) {
+    try { name = decodeURIComponent(extended[1]); } catch { name = undefined; }
+  }
+  name ??= /filename\s*=\s*"([^"]*)"/i.exec(header)?.[1] ?? /filename\s*=\s*([^;\s]+)/i.exec(header)?.[1];
+  const clean = name?.replace(UNSAFE_NAME, ' ').replace(/\s+/g, ' ').replace(/^[.\s]+/, '').trim();
+  return clean || undefined;
 }
 
 /** Fire-and-forget DELETE that survives the page closing (spec 4.2, "Leaving the page"). */

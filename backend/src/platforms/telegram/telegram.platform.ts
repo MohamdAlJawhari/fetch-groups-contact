@@ -28,6 +28,8 @@ export interface TelegramChatRecord {
   deactivated?: boolean;
   migrated?: boolean;
   megagroup?: boolean;
+  /** Telegram's `participantsCount`, when the dialog list carries it (often missing for supergroups). */
+  memberCount?: number;
   /** What member requests need: the raw chat or channel ID, and the channel access hash. */
   ref?: TelegramGroupRef;
 }
@@ -93,7 +95,9 @@ export function selectTelegramGroups(chats: readonly TelegramChatRecord[]): Grou
       : false;
     if (!keep || seen.has(chat.id)) continue;
     seen.add(chat.id);
-    groups.push({ id: chat.id, title: chat.title });
+    const count = chat.memberCount;
+    groups.push(typeof count === 'number' && Number.isInteger(count) && count >= 0
+      ? { id: chat.id, title: chat.title, memberCount: count } : { id: chat.id, title: chat.title });
   }
   return groups;
 }
@@ -386,12 +390,13 @@ interface DialogOffset { date: number; id: number; peer: Api.TypeEntityLike }
 function toChatRecord(chat: Api.TypeChat): TelegramChatRecord {
   if (chat instanceof Api.Chat) {
     return { kind: 'chat', id: getPeerId(chat), title: chat.title, left: chat.left, deactivated: chat.deactivated,
-      ref: { kind: 'chat', chatId: chat.id.toString() },
+      ref: { kind: 'chat', chatId: chat.id.toString() }, memberCount: chat.participantsCount ?? undefined,
       // Absent optional fields arrive as `null` from Telegram (not `undefined`), so test for a real value.
       migrated: Boolean(chat.migratedTo) && !(chat.migratedTo instanceof Api.InputChannelEmpty) };
   }
   if (chat instanceof Api.Channel) {
     return { kind: 'channel', id: getPeerId(chat), title: chat.title, left: chat.left, megagroup: chat.megagroup,
+      memberCount: chat.participantsCount ?? undefined,
       // A `min` channel object can lack its access hash; without one it can't be queried, so it gets no ref.
       ref: chat.accessHash ? { kind: 'channel', channelId: chat.id.toString(), accessHash: chat.accessHash.toString() } : undefined };
   }

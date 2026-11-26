@@ -36,7 +36,7 @@ export class FakePlatform implements Platform {
   }
   async listGroups() {
     await this.requireConnected();
-    return [{ id: 'sample-group-1', title: 'Sample team' }, { id: 'sample-group-2', title: 'Sample community' }];
+    return [{ id: 'sample-group-1', title: 'Sample team', memberCount: 3 }, { id: 'sample-group-2', title: 'Sample community', memberCount: 3 }];
   }
   async listContacts(groupIds: readonly string[]): Promise<CategorizedContacts> {
     const groups = await this.listGroups();

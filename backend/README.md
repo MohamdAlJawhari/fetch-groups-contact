@@ -91,8 +91,8 @@ All five routes require an active logged-in user who has changed their temporary
 | --- | --- | --- | --- |
 | POST | `/connections` | `{"platform":"telegram"}` or `{"platform":"whatsapp"}` | 201 with `id`, `platform`, `status`, and placeholder `qr`. |
 | GET | `/connections/:id` | None | 200 with status; `qr` appears only while waiting for scan. |
-| GET | `/connections/:id/groups` | None | 200 with `{"groups":[{"id":"sample-group-1","title":"Sample team"},...]}` once connected; 409 while waiting. |
-| POST | `/connections/:id/export` | `{"groupIds":["sample-group-1"]}` | 200 streaming `.xlsx`; then disconnects. See Export below. |
+| GET | `/connections/:id/groups` | None | 200 with `{"groups":[{"id":"sample-group-1","title":"Sample team","memberCount":3},...]}` once connected (`memberCount` only when the platform reports it); 409 while waiting. |
+| POST | `/connections/:id/export` | `{"groupIds":["sample-group-1"],"files":"merged"}` | 200 streaming `.xlsx` (or `.zip` with `"files":"separate"`); then disconnects. See Export below. |
 | DELETE | `/connections/:id` | None | 204; disconnects the platform and removes the registry entry. |
 
 The fake QR is a placeholder string, not a scannable login code. The fake platform reports `waiting-for-scan` initially and `connected` after three seconds, using an injectable clock rather than a background scan timer. The platform interface exposes `connect`, `getStatus`, `listGroups`, `listContacts`, and `disconnect`. Fake Telegram contacts have `saved`, `unsaved_reachable`, and `unsaved_unreachable` categories. Fake WhatsApp contacts have `saved` and `unsaved` categories. Contacts leave the backend only inside the exported `.xlsx`.
@@ -118,11 +118,14 @@ Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)" -Me
 
 ## Export (step 5)
 
-`POST /connections/:id/export` with `{"groupIds":[...]}` (1–50 unique IDs from `/groups`) streams `contacts-<platform>-<UTC date>.xlsx`, then disconnects the connection. The full rules are in `docs/specs/05-export.md`.
+`POST /connections/:id/export` with `{"groupIds":[...], "files": "merged" | "separate"}` (1–50 unique IDs from `/groups`, `files` optional) streams the file, then disconnects the connection. The full rules are in `docs/specs/05-export.md`.
+
+- **Names** (`src/export/export.filename.ts`, spec 4.6): one group → `<title> - <UTC date>.xlsx`; several → `<n> groups - <date>.xlsx`, or `<n> groups - <date>.zip` with `"separate"`. Titles are made safe for Windows (forbidden, control, and bidi characters removed, at most 80 characters). The real name goes in `filename*` (UTF-8), with an ASCII `filename` fallback.
+- **Separate files** (`src/export/zip.writer.ts`): each group is fetched on its own (`ExportService.prepareEach`) before streaming, deduplicated within that group only, and written as one workbook per zip entry (built in memory, stored uncompressed, UTF-8 names) with `archiver@5.3.2`, the version ExcelJS already uses.
 
 | Status | Message | When |
 | --- | --- | --- |
-| 400 | `select between 1 and 50 groups` | Bad or duplicate `groupIds`, or extra fields |
+| 400 | `select between 1 and 50 groups` | Bad or duplicate `groupIds`, a bad `files` value, or extra fields |
 | 400 | `unknown group selected` | An ID isn't one of the connection's groups |
 | 404 | `connection not found` | Missing or not yours, or ended (for example by `DELETE`) while contacts were being fetched |
 | 409 | `connection is not connected yet` / `an export is already running` | |

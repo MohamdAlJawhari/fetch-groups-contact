@@ -14,6 +14,10 @@ export interface UserWithTemporaryPassword { user: AdminUser; temporaryPassword:
 /** POST /connections, GET /connections/:id, POST /connections/:id/password */
 export interface ConnectionView { id: string; platform: PlatformName; status: ConnectionStatus; qr?: string; passwordHint?: string }
 
-export interface Group { id: string; title: string }
+/** `memberCount` is missing when the platform didn't report it (often for big Telegram supergroups). */
+export interface Group { id: string; title: string; memberCount?: number }
+
+/** POST /connections/:id/export `files`: one merged workbook, or a zip with one workbook per group. */
+export type ExportFiles = 'merged' | 'separate';
 
 export const MAX_GROUPS = 50;
