@@ -392,7 +392,7 @@ for (const [platform, sheets] of [
   ['telegram', ['Saved', 'Unsaved reachable', 'Unsaved unreachable']],
   ['whatsapp', ['Saved', 'Unsaved reachable', 'Unsaved unreachable']],
 ] as const) {
-  test(`${platform} export streams an xlsx, audits start/finish, then disconnects`, async () => {
+  test(`${platform} export streams an xlsx, audits start/finish, and keeps the connection`, async () => {
     const f = await fixture();
     try {
       const {cookie, id} = await connected(f, platform);
@@ -407,10 +407,18 @@ for (const [platform, sheets] of [
       await workbook.xlsx.load(await response.arrayBuffer());
       assert.deepEqual(workbook.worksheets.map(sheet => sheet.name), sheets);
       assert.ok(workbook.worksheets.every(sheet => sheet.rowCount === 2));
-      assert.equal((await f.request('GET', `/connections/${id}`, cookie)).status, 404);
+      // Kept (2026-11-26): still connected, and only Disconnect ends it.
+      await waitFor(() => f.connectionRegistry.get(id)?.exporting === false);
+      assert.equal((await (await f.request('GET', `/connections/${id}`, cookie)).json() as {status: string}).status, 'connected');
+      assert.deepEqual(await platformObject.getStatus(), {status: 'connected'});
+      const again = await f.request('POST', `/connections/${id}/export`, cookie, {groupIds: ['sample-group-1']});
+      assert.equal(again.status, 200);
+      await again.arrayBuffer();
+      await waitFor(() => f.connectionRegistry.get(id)?.exporting === false);
+      assert.equal((await f.request('DELETE', `/connections/${id}`, cookie)).status, 204);
       assert.deepEqual(await platformObject.getStatus(), {status: 'disconnected'});
       const audit = f.events.filter(event => event.action !== 'login');
-      assert.deepEqual(audit, ['connection_started', 'export_started', 'export_finished', 'connection_ended']
+      assert.deepEqual(audit, ['connection_started', 'export_started', 'export_finished', 'export_started', 'export_finished', 'connection_ended']
         .map(action => ({userId: f.a.id, action, platform, targetUserId: undefined})));
     } finally { await f.close(); }
   });
@@ -443,7 +451,7 @@ test('one selected group: the file is named after the group, also when "separate
   }
 });
 
-test('"separate" with several groups streams a zip with one workbook per group, then disconnects', async () => {
+test('"separate" with several groups streams a zip with one workbook per group, and keeps the connection', async () => {
   const f = await fixture();
   try {
     const {cookie, id} = await connected(f, 'whatsapp');
@@ -459,8 +467,9 @@ test('"separate" with several groups streams a zip with one workbook per group, 
       await workbook.xlsx.load(await entry.async('arraybuffer'));
       assert.deepEqual(workbook.worksheets.map(sheet => sheet.name), ['Saved', 'Unsaved reachable', 'Unsaved unreachable']);
     }
-    assert.equal((await f.request('GET', `/connections/${id}`, cookie)).status, 404);
-    assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_finished', 'connection_ended']);
+    await waitFor(() => f.connectionRegistry.get(id)?.exporting === false);
+    assert.equal((await f.request('GET', `/connections/${id}`, cookie)).status, 200);
+    assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_finished']);
   } finally { await f.close(); }
 });
 
@@ -499,7 +508,7 @@ for (const [platform, headers] of [['telegram', ['Name', 'Phone', 'Username']], 
       assert.equal(groupsExport.status, 200);
       await groupsExport.arrayBuffer();
       assert.deepEqual(f.events.filter(event => event.action !== 'login').map(event => event.action), [
-        'connection_started', 'contacts_export_started', 'contacts_export_finished', 'export_started', 'export_finished', 'connection_ended',
+        'connection_started', 'contacts_export_started', 'contacts_export_finished', 'export_started', 'export_finished',
       ]);
       assert.ok(f.events.every(event => event.action === 'login' || (event.platform === platform && event.targetUserId === undefined)));
     } finally { await f.close(); }
@@ -603,8 +612,9 @@ test('a platform failure before streaming returns 502, keeps the connection, log
     const retried = await f.request('POST', `/connections/${id}/export`, cookie, groups);
     assert.equal(retried.status, 200);
     await retried.arrayBuffer();
+    await waitFor(() => f.connectionRegistry.get(id)?.exporting === false);
     assert.deepEqual(exportActions(f.events),
-      ['connection_started', 'export_started', 'export_failed', 'export_started', 'export_finished', 'connection_ended']);
+      ['connection_started', 'export_started', 'export_failed', 'export_started', 'export_finished']);
   } finally { await f.close(); }
 });
 
@@ -659,6 +669,12 @@ test('while an export is fetching: a second export gets 409, status is not block
     const response = await first;
     assert.equal(response.status, 200);
     await response.arrayBuffer();
+    await waitFor(() => f.connectionRegistry.get(id)?.exporting === false);
+    assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_finished']);
+    // Kept after the export: idle from now on, so the reaper ends it after the timeout.
+    f.advance(700_000);
+    await f.reaper.runOnce();
+    assert.equal(f.connectionRegistry.get(id), undefined);
     assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_finished', 'connection_ended']);
   } finally { release.open(); await f.close(); }
 });
@@ -872,8 +888,8 @@ test('export: a group with a hidden member list returns 400 with only selected g
     const retry = await f.request('POST', `/connections/${id}/export`, cookie, {groupIds: ['sample-group-1']});
     assert.equal(retry.status, 200);
     await retry.arrayBuffer();
-    await waitFor(() => f.events.some(event => event.action === 'connection_ended'));
-    assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_failed', 'export_started', 'export_finished', 'connection_ended']);
+    await waitFor(() => f.connectionRegistry.get(id)?.exporting === false);
+    assert.deepEqual(exportActions(f.events), ['connection_started', 'export_started', 'export_failed', 'export_started', 'export_finished']);
   } finally { await f.close(); }
 });
 

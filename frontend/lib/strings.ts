@@ -97,7 +97,7 @@ export const strings = {
     contactsExporting: 'Exporting contacts…',
     contactsConfirmTitle: 'Export all contacts saved on this account?',
     contactsConfirmBody: 'Only do this if the account owner agreed. You can still export groups afterwards.',
-    contactsDone: 'Contacts downloaded. You can still export groups, or disconnect.',
+    contactsDone: 'Contacts downloaded. You can export groups too, or disconnect when you are finished.',
     memberCount: (count: number) => `${count.toLocaleString('en')} ${count === 1 ? 'member' : 'members'}`,
     filesLegend: 'How do you want the file?',
     filesMerged: 'One file',
@@ -108,9 +108,8 @@ export const strings = {
     exporting: 'Exporting… this can take a few minutes for big groups',
     disconnect: 'Disconnect',
     downloadFailed: 'The download failed. Please start again.',
-
-    doneTitle: 'Done',
-    done: 'Done. Your file is downloaded and your account was disconnected.',
+    exported: 'Your file is downloaded. You can export more groups, or disconnect when you are finished.',
+    disconnected: 'Disconnected. Your account is no longer linked to this tool.',
   },
 
   admin: {

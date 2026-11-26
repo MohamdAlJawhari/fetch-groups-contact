@@ -95,7 +95,7 @@ All five routes require an active logged-in user who has changed their temporary
 | POST | `/connections` | `{"platform":"telegram"}` or `{"platform":"whatsapp"}` | 201 with `id`, `platform`, `status`, and placeholder `qr`. |
 | GET | `/connections/:id` | None | 200 with status; `qr` appears only while waiting for scan. |
 | GET | `/connections/:id/groups` | None | 200 with `{"groups":[{"id":"sample-group-1","title":"Sample team","memberCount":3},...]}` once connected (`memberCount` only when the platform reports it); 409 while waiting. |
-| POST | `/connections/:id/export` | `{"groupIds":["sample-group-1"],"files":"merged"}` | 200 streaming `.xlsx` (or `.zip` with `"files":"separate"`); then disconnects. See Export below. |
+| POST | `/connections/:id/export` | `{"groupIds":["sample-group-1"],"files":"merged"}` | 200 streaming `.xlsx` (or `.zip` with `"files":"separate"`); the connection is **kept** (T53). See Export below. |
 | POST | `/connections/:id/export-contacts` | None or `{}` | 200 streaming the account's saved contacts as one `Contacts` sheet; the connection is **kept** (spec 09). |
 | DELETE | `/connections/:id` | None | 204; disconnects the platform and removes the registry entry. |
 
@@ -122,11 +122,11 @@ Invoke-RestMethod -Uri "http://localhost:3000/connections/$($connection.id)" -Me
 
 ## Export (step 5)
 
-`POST /connections/:id/export` with `{"groupIds":[...], "files": "merged" | "separate"}` (1–50 unique IDs from `/groups`, `files` optional) streams the file, then disconnects the connection. The full rules are in `docs/specs/05-export.md`.
+`POST /connections/:id/export` with `{"groupIds":[...], "files": "merged" | "separate"}` (1–50 unique IDs from `/groups`, `files` optional) streams the file and keeps the connection, so more exports need no new scan. A broken stream still ends it. The full rules are in `docs/specs/05-export.md`.
 
 - **Names** (`src/export/export.filename.ts`, spec 4.6): one group → `<title> - <UTC date>.xlsx`; several → `<n> groups - <date>.xlsx`, or `<n> groups - <date>.zip` with `"separate"`. Titles are made safe for Windows (forbidden, control, and bidi characters removed, at most 80 characters). The real name goes in `filename*` (UTF-8), with an ASCII `filename` fallback.
 - **Telegram channels** (spec 06b): broadcast channels the account owns or administers are listed by `GET /groups` with `kind: "channel"` and fetched like supergroups. The fake Telegram platform has one, `sample-channel-1`.
-- **Phone contacts** (spec 09): `Platform.listAddressBook()`. Telegram makes one throttled `contacts.getContacts` request, and WhatsApp reads the saved contacts the existing sync brought (no new request). `ConnectionsService.exportAddressBook` uses the same flow as the group export (`runJob`), but keeps the connection on success and audits `contacts_export_*`.
+- **Phone contacts** (spec 09): `Platform.listAddressBook()`. Telegram makes one throttled `contacts.getContacts` request, and WhatsApp reads the saved contacts the existing sync brought (no new request). `ConnectionsService.exportAddressBook` uses the same flow as the group export (`runJob`, which keeps the connection on success) and audits `contacts_export_*`.
 - **Separate files** (`src/export/zip.writer.ts`): each group is fetched on its own (`ExportService.prepareEach`) before streaming, deduplicated within that group only, and written as one workbook per zip entry (built in memory, stored uncompressed, UTF-8 names) with `archiver@5.3.2`, the version ExcelJS already uses.
 
 | Status | Message | When |

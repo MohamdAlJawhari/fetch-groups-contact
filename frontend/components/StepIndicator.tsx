@@ -5,7 +5,8 @@ import { Fragment } from 'react';
 import { strings } from '@/lib/strings';
 
 // Design system "StepIndicator": Platform · Scan · Groups · Download. Flex gaps, so it mirrors in right-to-left.
-export function StepIndicator({ current }: { current: 1 | 2 | 3 | 4 }) {
+// `current` 5 means every step is done (a file was downloaded).
+export function StepIndicator({ current }: { current: 1 | 2 | 3 | 4 | 5 }) {
   return (
     <ol className="flex flex-wrap items-center gap-2" aria-label="Progress">
       {strings.steps.map((label, index) => {

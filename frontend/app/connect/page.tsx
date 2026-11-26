@@ -18,13 +18,13 @@ export default function ConnectPage() {
   return <AppShell>{() => <ConnectFlow />}</AppShell>;
 }
 
-type Step = 'choose' | 'scan' | 'failed' | 'groups' | 'done';
-interface Notice { tone: 'error' | 'info'; text: string; retryGroups?: boolean }
+type Step = 'choose' | 'scan' | 'failed' | 'groups';
+interface Notice { tone: 'error' | 'info' | 'success'; text: string; retryGroups?: boolean }
 const c = strings.connect;
 const POLL_MS = 2_000;
 const messageOf = (caught: unknown) => sentence(caught instanceof ApiError ? caught.message : strings.errors.unexpected);
 
-/** docs/specs/07-frontend.md 4.2: choose a platform → scan (→ Telegram password) → pick groups → download. */
+/** docs/specs/07-frontend.md 4.2: choose a platform → scan (→ Telegram password) → pick groups → download (repeatable) → Disconnect. */
 function ConnectFlow() {
   const [step, setStep] = useState<Step>('choose');
   const [connection, setConnection] = useState<ConnectionView>();
@@ -44,6 +44,8 @@ function ConnectFlow() {
   const [confirmContacts, setConfirmContacts] = useState(false);
   const [exportingContacts, setExportingContacts] = useState(false);
   const busy = exporting || exportingContacts;
+  /** At least one file downloaded on this connection: the step indicator then shows every step done. */
+  const [downloaded, setDownloaded] = useState(false);
 
   function track(view: ConnectionView | undefined) {
     liveId.current = view?.id;
@@ -58,6 +60,7 @@ function ConnectFlow() {
     setHidden(new Set());
     setFiles('merged');
     setConfirmContacts(false);
+    setDownloaded(false);
     setPassword('');
     setPasswordError(undefined);
     setNotice(next);
@@ -134,12 +137,13 @@ function ConnectFlow() {
     }
   }
 
-  async function disconnect() {
+  /** Cancel during the scan, or Disconnect on the groups page: either way back to the first page. */
+  async function disconnect(next?: Notice) {
     const id = connection?.id;
     setCancelling(true);
     try { if (id) await api(`/connections/${id}`, { method: 'DELETE' }); } catch { /* already gone */ }
     setCancelling(false);
-    reset();
+    reset(next);
   }
 
   async function submitPassword(event: FormEvent) {
@@ -171,7 +175,8 @@ function ConnectFlow() {
     setNotice(undefined);
     try {
       await apiDownload(`/connections/${connection.id}/export-contacts`, {}, `phone-contacts-${connection.platform}.xlsx`);
-      setNotice({ tone: 'info', text: c.contactsDone });
+      setDownloaded(true);
+      setNotice({ tone: 'success', text: c.contactsDone });
     } catch (caught) {
       const error = caught instanceof ApiError ? caught : undefined;
       if (error?.status === 404) reset({ tone: 'error', text: c.connectionEnded });
@@ -191,8 +196,10 @@ function ConnectFlow() {
     try {
       await apiDownload(`/connections/${connection.id}/export`, { groupIds: [...selected], files },
         `contacts-${connection.platform}.${zip ? 'zip' : 'xlsx'}`);
-      track(undefined); // the server disconnected after the export
-      setStep('done');
+      // The server keeps the connection (spec 05, 4.4): stay here for more exports until Disconnect.
+      setSelected(new Set());
+      setDownloaded(true);
+      setNotice({ tone: 'success', text: c.exported });
     } catch (caught) {
       const error = caught instanceof ApiError ? caught : undefined;
       if (error?.status === 400 && error.groupIds?.length) {
@@ -212,7 +219,8 @@ function ConnectFlow() {
     }
   }
 
-  const current = step === 'choose' ? 1 : step === 'scan' || step === 'failed' ? 2 : step === 'groups' && !exporting ? 3 : 4;
+  // 5 = all four steps done: after a download the user stays on the groups page (T53), but "Download" is ticked.
+  const current = step === 'choose' ? 1 : step === 'scan' || step === 'failed' ? 2 : busy ? 4 : downloaded ? 5 : 3;
   const noticeBox = notice && (
     <Callout tone={notice.tone} action={notice.retryGroups && connection
       ? <Button size="sm" onClick={() => void loadGroups(connection.id)}>{c.retry}</Button> : undefined}>
@@ -289,7 +297,7 @@ function ConnectFlow() {
               {selected.size > 1 && <FilesChoice value={files} count={selected.size} disabled={busy} onChange={setFiles} />}
               <div className="flex flex-wrap gap-2">
                 <Button variant="primary" busy={exporting} busyLabel={c.exporting} disabled={selected.size === 0 || exportingContacts} onClick={() => void exportFile()}>{c.export}</Button>
-                <Button onClick={() => void disconnect()} busy={cancelling} disabled={busy}>{c.disconnect}</Button>
+                <Button onClick={() => void disconnect({ tone: 'info', text: c.disconnected })} busy={cancelling} disabled={busy}>{c.disconnect}</Button>
               </div>
               <ConfirmDialog open={confirmContacts} title={c.contactsConfirmTitle} body={c.contactsConfirmBody}
                 confirmLabel={c.contactsExport} confirmVariant="primary"
@@ -301,13 +309,6 @@ function ConnectFlow() {
         </section>
       )}
 
-      {step === 'done' && (
-        <section className="flex flex-col gap-6">
-          <Heading title={c.doneTitle} />
-          <Callout tone="success">{c.done}</Callout>
-          <div><Button variant="primary" onClick={() => reset()}>{c.startAgain}</Button></div>
-        </section>
-      )}
     </div>
   );
 }

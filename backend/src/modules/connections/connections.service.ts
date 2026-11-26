@@ -117,7 +117,7 @@ export class ConnectionsService {
     let titles: string[] = [];
     // Spec 4.6: "separate" only means something for two or more groups.
     const separate = files === 'separate' && groupIds.length > 1;
-    return this.runJob(ownerId, id, { audit: GROUP_EXPORT, endOnSuccess: true, selectedIds: groupIds,
+    return this.runJob(ownerId, id, { audit: GROUP_EXPORT, selectedIds: groupIds,
       validate: async entry => {
         let known: Map<string, string>;
         try { known = new Map((await entry.platform.listGroups()).map(group => [group.id, group.title])); }
@@ -140,11 +140,11 @@ export class ConnectionsService {
   }
 
   /**
-   * docs/specs/09-phone-contacts.md: the same rules as the group export, except that the connection is **kept**
-   * after a successful download, so the user can still export groups (the user, 2026-11-26).
+   * docs/specs/09-phone-contacts.md: the same rules as the group export, with its own file and audit actions.
+   * Like every export, the connection is kept after a successful download (the user, 2026-11-26).
    */
   exportAddressBook(ownerId: string, id: string): Promise<ExportJob> {
-    return this.runJob(ownerId, id, { audit: CONTACTS_EXPORT, endOnSuccess: false, selectedIds: [],
+    return this.runJob(ownerId, id, { audit: CONTACTS_EXPORT, selectedIds: [],
       validate: async () => {},
       prepare: async (entry, date) => {
         const book = await this.exporter.prepareAddressBook(entry.platform);
@@ -156,7 +156,7 @@ export class ConnectionsService {
 
   /** Spec 05, 4.4, shared by both exports: checks under the lock, then fetching and streaming outside it. */
   private async runJob(ownerId: string, id: string, job: {
-    audit: ExportAudit; endOnSuccess: boolean; selectedIds: readonly string[];
+    audit: ExportAudit; selectedIds: readonly string[];
     validate(entry: ConnectionEntry): Promise<void>;
     prepare(entry: ConnectionEntry, date: string): Promise<Pick<ExportJob, 'kind' | 'filename'> & { write(out: Writable): Promise<void> }>;
   }): Promise<ExportJob> {
@@ -205,7 +205,7 @@ export class ConnectionsService {
       startedAt,
       kind: prepared.kind,
       filename: prepared.filename,
-      write: out => this.streamExport(entry, prepared.write, out, state, job.audit, job.endOnSuccess),
+      write: out => this.streamExport(entry, prepared.write, out, state, job.audit),
     };
   }
 
@@ -247,7 +247,7 @@ export class ConnectionsService {
   }
   private isLive(entry: ConnectionEntry) { return this.registry.get(entry.id) === entry; }
   private async streamExport(entry: ConnectionEntry, write: (out: Writable) => Promise<void>, out: Writable, state: StreamState,
-    audit: ExportAudit, endOnSuccess: boolean) {
+    audit: ExportAudit) {
     state.out = out;
     let succeeded = false;
     try {
@@ -265,8 +265,8 @@ export class ConnectionsService {
         const live = this.isLive(entry);
         await this.audit.record(entry.ownerId, succeeded ? audit.finished : audit.failed, entry.platformName);
         if (!live) return;
-        if (succeeded && !endOnSuccess) {
-          // Phone contacts (spec 09): keep the link for a group export; the idle timer restarts now.
+        if (succeeded) {
+          // Spec 05, 4.4 (2026-11-26): keep the link for more exports until Disconnect; the idle timer restarts now.
           entry.exporting = false;
           this.registry.touch(entry.id);
         } else {
