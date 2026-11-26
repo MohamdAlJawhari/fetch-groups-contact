@@ -1,7 +1,9 @@
 import { z } from 'zod';
 
-// An empty value (`TELEGRAM_API_ID=` in .env) counts as unset.
-const optional = <T extends z.ZodType>(schema: T) => z.preprocess(value => value === '' ? undefined : value, schema.optional());
+// An empty or blank value counts as unset: `TELEGRAM_API_ID=` in .env, or `$env:TELEGRAM_API_ID=' '` in PowerShell
+// (where assigning '' deletes the variable, so dotenv would load the .env value again).
+const blankToUndefined = (value: unknown) => (typeof value === 'string' && value.trim() === '' ? undefined : value);
+const optional = <T extends z.ZodType>(schema: T) => z.preprocess(blankToUndefined, schema.optional());
 
 const environmentSchema = z.object({
   DATABASE_URL: z.string().url().refine((value) => {
@@ -22,10 +24,10 @@ const environmentSchema = z.object({
   TELEGRAM_API_HASH: optional(z.string().regex(/^[0-9a-f]{32}$/i, 'Must be the 32-character hex api_hash from my.telegram.org')),
   // T24: off by default. Behind Caddy on the same machine use `loopback`; a hop count or an IP/subnet list also works.
   // `true` (trust every proxy) is refused: anyone reaching the backend directly could then spoof their IP.
-  TRUST_PROXY: z.preprocess(value => value === '' ? undefined : value, z.string().trim()
+  TRUST_PROXY: z.preprocess(blankToUndefined, z.string().trim()
     .refine(value => value.toLowerCase() !== 'true', 'Use loopback, a hop count, or proxy IPs; true would trust spoofed headers')
     .optional()),
-  WHATSAPP_PLATFORM: z.preprocess(value => value === '' ? undefined : value, z.enum(['baileys', 'fake']).default('baileys')),
+  WHATSAPP_PLATFORM: z.preprocess(blankToUndefined, z.enum(['baileys', 'fake']).default('baileys')),
 }).superRefine((value, context) => {
   if (value.WHATSAPP_PLATFORM === 'fake' && value.NODE_ENV === 'production') {
     context.addIssue({ code: 'custom', path: ['WHATSAPP_PLATFORM'], message: 'Must be baileys in production' });

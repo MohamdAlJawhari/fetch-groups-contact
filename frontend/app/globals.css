@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+/* The "Contact Export" design system maps every token to a default Tailwind class (its tailwind.md);
+   the only theme change is the font stack. No web fonts are loaded (spec 07, 4.6). */
+@theme {
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", "Noto Sans Arabic", Tahoma, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+/* Focus ring for every interactive element: 2px blue-600, 2px offset, only for keyboard focus. Never removed. */
+@utility focus-ring {
+  &:focus-visible {
+    outline: 2px solid var(--color-blue-600);
+    outline-offset: 2px;
+  }
+}
+
+html {
+  color-scheme: light;
+}
+
+/* The confirm dialog's backdrop (the design system's `overlay`). */
+dialog::backdrop {
+  background-color: rgb(28 25 23 / 0.4);
+}

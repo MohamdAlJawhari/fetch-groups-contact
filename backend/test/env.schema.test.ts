@@ -44,3 +44,9 @@ test('TRUST_PROXY is off by default and accepts loopback, a hop count, or proxy 
   assert.throws(() => parseEnvironment({ ...base, TRUST_PROXY: 'TRUE' }), /TRUST_PROXY/);
   assert.equal(parseTrustProxy(undefined), false);
 });
+
+test('blank values (spaces) count as unset, so PowerShell can blank a variable that .env sets', () => {
+  assert.equal(parseEnvironment({ ...base, TELEGRAM_API_ID: ' ', TELEGRAM_API_HASH: ' ' }).telegram, undefined);
+  assert.equal(parseEnvironment({ ...base, WHATSAPP_PLATFORM: '  ' }).whatsappPlatform, 'baileys');
+  assert.equal(parseEnvironment({ ...base, TRUST_PROXY: ' ' }).trustProxy, false);
+});
